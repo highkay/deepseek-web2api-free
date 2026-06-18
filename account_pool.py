@@ -67,6 +67,7 @@ class Account:
     email: str = ""
     id: str = field(default_factory=_account_id)
     source: str = "file"       # file | env
+    proxy: str = ""             # per-account upstream proxy (optional)
     created_at: int = field(default_factory=_now)
     updated_at: int = field(default_factory=_now)
     state: str = "idle"        # idle | busy | error
@@ -78,7 +79,11 @@ class Account:
     @property
     def adapter(self) -> DeepSeekAdapter:
         if self._adapter is None:
-            self._adapter = DeepSeekAdapter(token=self.token, cookies=self.cookies)
+            self._adapter = DeepSeekAdapter(
+                token=self.token,
+                cookies=self.cookies,
+                proxy=self.proxy or None,
+            )
         return self._adapter
 
     @property
@@ -169,6 +174,7 @@ class AccountPool:
             token = os.environ.get(f"DEEPSEEK_TOKEN_{i}", "").strip()
             cookies = os.environ.get(f"DEEPSEEK_COOKIES_{i}", "").strip()
             email = os.environ.get(f"DEEPSEEK_EMAIL_{i}", "").strip() or f"env-{i}"
+            proxy = os.environ.get(f"DEEPSEEK_PROXY_{i}", "").strip()
             if not token and not cookies:
                 continue
             if not token or not cookies:
@@ -179,18 +185,21 @@ class AccountPool:
                 email=email,
                 token=token,
                 cookies=cookies,
+                proxy=proxy,
                 source="env",
             ))
 
         token = os.environ.get("DEEPSEEK_TOKEN", "").strip()
         cookies = os.environ.get("DEEPSEEK_COOKIES", "").strip()
         email = os.environ.get("DEEPSEEK_EMAIL", "").strip() or "env-default"
+        proxy = os.environ.get("DEEPSEEK_PROXY", "").strip()
         if token and cookies:
             self._append_loaded(Account(
                 id="env-default",
                 email=email,
                 token=token,
                 cookies=cookies,
+                proxy=proxy,
                 source="env",
             ))
         elif token or cookies:

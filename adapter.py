@@ -1,24 +1,45 @@
 """
 DeepSeek Chat API Adapter - WASM-based PoW solving, session management, streaming
 Supports expert mode (thinking_enabled, search_enabled).
+
+Anti-detection upgrades (2026-06):
+- TLS/JA3 impersonation via curl_cffi (chrome131)
+- Header set & values captured from a real Chrome 149 + chat.deepseek.com session
+- Cookie jar auto-rotates Set-Cookie (cf_clearance / awswaf token refresh)
+- Detects 405 x-amzn-waf-action=captcha and 403/429 cf-mitigated=challenge
 """
 import json
 import os
 import time
 import struct
 import base64
+import random
 import threading
-import httpx
+from pathlib import Path
 from dotenv import load_dotenv
 from wasmtime import Store, Module, Instance
+
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError as e:
+    raise SystemExit(
+        "curl_cffi is required for TLS fingerprint impersonation.\n"
+        "Run: pip install -r requirements.txt"
+    ) from e
 
 load_dotenv()
 
 COOKIES = os.environ.get("DEEPSEEK_COOKIES", "")
 BASE_URL = "https://chat.deepseek.com"
 TOKEN = os.environ.get("DEEPSEEK_TOKEN", "")
+IMPERSONATE = os.environ.get("DEEPSEEK_IMPERSONATE", "chrome131")
+try:
+    JITTER_SECS = max(0.0, float(os.environ.get("DEEPSEEK_JITTER_SECS", "0") or 0))
+except ValueError:
+    JITTER_SECS = 0.0
 
-with open("sha3_wasm_bg.wasm", "rb") as f:
+_WASM_PATH = Path(__file__).resolve().parent / "sha3_wasm_bg.wasm"
+with open(_WASM_PATH, "rb") as f:
     _WASM_BYTES = f.read()
 
 
@@ -28,6 +49,15 @@ class WASMError(Exception):
 
 class PoWError(Exception):
     pass
+
+
+class WAFChallengeError(Exception):
+    """Raised when AWS WAF or Cloudflare returns a challenge response."""
+    def __init__(self, kind: str, status: int, body: str = ""):
+        super().__init__(f"{kind} challenge ({status}): {body[:200]}")
+        self.kind = kind
+        self.status = status
+        self.body = body
 
 
 class _WASMSolver:
@@ -87,40 +117,69 @@ class _WASMSolver:
 class DeepSeekAdapter:
     """Adapter for DeepSeek Chat API"""
 
-    def __init__(self, token: str = TOKEN, cookies: str = COOKIES):
+    # Captured 2026-06-19 from a live Chrome 149 session on chat.deepseek.com.
+    # We DOWNGRADE the UA string to Chrome 131 to match what curl_cffi's
+    # `chrome131` impersonation profile actually negotiates at the TLS layer:
+    # the JA3/JA4 fingerprint comes from a Chrome 131 build, so a Chrome 149
+    # UA on a Chrome 131 ClientHello is itself a fingerprint mismatch. Bump
+    # both together when curl_cffi adds newer chrome profiles.
+    _DEFAULT_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+    _DEFAULT_SEC_CH_UA = (
+        '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+    )
+
+    def __init__(self, token: str = TOKEN, cookies: str = COOKIES,
+                 impersonate: str = IMPERSONATE, proxy: str | None = None):
         self.token = self._normalize_token(token)
         self.cookies = cookies
+        self.impersonate = impersonate
         self._solver = None
-        self._client = httpx.Client(timeout=120)
+        # curl_cffi.Session keeps a cookie jar that auto-merges Set-Cookie,
+        # so cf_clearance / AWS WAF tokens stay fresh across calls.
+        self._client = cffi_requests.Session(
+            impersonate=impersonate,
+            timeout=120,
+            proxies={"all": proxy} if proxy else None,
+        )
+        # Seed jar from the user-supplied cookie blob (one-shot import only;
+        # afterwards the jar is the source of truth).
+        if cookies:
+            for part in cookies.split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                try:
+                    self._client.cookies.set(
+                        name.strip(), value.strip(), domain=".deepseek.com"
+                    )
+                except Exception:
+                    pass
+
         self._msg_counters: dict[str, int] = {}
-        # Header set captured from a live Chrome 149 session against
-        # chat.deepseek.com (frontend commit 1300ef9f7, captured 2026-06-19).
+        # Header set captured from a live browser fetch().
         # Names use the same casing the real browser sends.
         self._base_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": self._DEFAULT_UA,
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
-            "Cookie": cookies,
             "Origin": BASE_URL,
             "Referer": f"{BASE_URL}/",
             "Priority": "u=1, i",
-            "Sec-Ch-Ua": (
-                '"Google Chrome";v="131", "Chromium";v="131", '
-                '"Not_A Brand";v="24"'
-            ),
+            "Sec-Ch-Ua": self._DEFAULT_SEC_CH_UA,
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            # Application headers — values verified against the live frontend.
+            # DeepSeek-specific application headers (current as of 2026-06-19).
             "X-App-Version": "2.0.0",
             "X-Client-Version": "2.0.0",
             "X-Client-Platform": "web",
@@ -135,10 +194,9 @@ class DeepSeekAdapter:
 
         DeepSeek stores its token in localStorage as
             {"value":"<bare-token>","__version":"0"}
-        but the network layer sends only the bare value as
-            Authorization: Bearer <bare-token>
-        Users sometimes copy the localStorage form by mistake. Auto-unwrap
-        it so the adapter accepts either form.
+        but the network layer sends only the bare value as `Authorization:
+        Bearer <bare-token>`. Users sometimes copy the localStorage form by
+        mistake. Auto-unwrap it so the adapter accepts either form.
         """
         if not token:
             return token
@@ -154,6 +212,20 @@ class DeepSeekAdapter:
                 pass
         return s
 
+    @staticmethod
+    def _detect_waf_challenge(status: int, headers) -> str | None:
+        """Return the challenge kind if the response is a WAF/CDN challenge."""
+        get = headers.get if hasattr(headers, "get") else lambda k, d=None: dict(headers).get(k, d)
+        waf_action = (get("x-amzn-waf-action") or "").lower()
+        cf_mitigated = (get("cf-mitigated") or "").lower()
+        if status == 405 and waf_action == "captcha":
+            return "aws-waf-captcha"
+        if status == 202 and waf_action == "challenge":
+            return "aws-waf-challenge"
+        if status in (403, 429) and cf_mitigated == "challenge":
+            return "cloudflare-challenge"
+        return None
+
     @property
     def solver(self):
         if self._solver is None:
@@ -166,6 +238,9 @@ class DeepSeekAdapter:
             json={"target_path": target_path},
             headers=self._base_headers,
         )
+        kind = self._detect_waf_challenge(resp.status_code, resp.headers)
+        if kind:
+            raise WAFChallengeError(kind, resp.status_code, resp.text)
         resp.raise_for_status()
         data = resp.json()
         try:
@@ -193,6 +268,8 @@ class DeepSeekAdapter:
         return base64.b64encode(raw.encode()).decode()
 
     def _pow_headers(self, target_path: str = "/api/v0/chat/completion"):
+        if JITTER_SECS > 0:
+            time.sleep(random.uniform(0, JITTER_SECS))
         c = self._get_challenge(target_path)
         pow_h = self._solve(c)
         return {**self._base_headers, "X-DS-PoW-Response": pow_h}
@@ -205,6 +282,9 @@ class DeepSeekAdapter:
             json={"target_path": "/api/v0/chat/completion"},
             headers=headers,
         )
+        kind = self._detect_waf_challenge(resp.status_code, resp.headers)
+        if kind:
+            raise WAFChallengeError(kind, resp.status_code, resp.text)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
@@ -255,6 +335,9 @@ class DeepSeekAdapter:
             json=body,
             headers=headers,
         )
+        kind = self._detect_waf_challenge(resp.status_code, resp.headers)
+        if kind:
+            raise WAFChallengeError(kind, resp.status_code, resp.text)
         resp.raise_for_status()
         return resp
 
@@ -355,14 +438,29 @@ class DeepSeekAdapter:
             "search_enabled": search_enabled,
             "preempt": False,
         }
-        with self._client.stream(
-            "POST", f"{BASE_URL}/api/v0/chat/completion",
-            json=body, headers=headers,
-        ) as resp:
+        resp = self._client.post(
+            f"{BASE_URL}/api/v0/chat/completion",
+            json=body, headers=headers, stream=True,
+        )
+        try:
+            kind = self._detect_waf_challenge(resp.status_code, resp.headers)
+            if kind:
+                # Drain so the connection can be reused.
+                try:
+                    body_text = resp.text
+                except Exception:
+                    body_text = ""
+                raise WAFChallengeError(kind, resp.status_code, body_text)
             resp.raise_for_status()
             frag_type = None  # None, 'thinking', 'content'
 
             for line in resp.iter_lines():
+                # curl_cffi yields bytes from iter_lines.
+                if isinstance(line, (bytes, bytearray)):
+                    try:
+                        line = line.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
                 line = line.strip()
                 if not line:
                     continue
@@ -452,3 +550,8 @@ class DeepSeekAdapter:
                 if p == "response/status":
                     yield {"__type": "status", "status": v}
                     continue
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass

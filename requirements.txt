@@ -1,5 +1,6 @@
 fastapi>=0.100.0
 uvicorn>=0.20.0
 httpx>=0.24.0
+curl_cffi>=0.7.0
 wasmtime>=14.0.0
 python-dotenv>=1.0.0
