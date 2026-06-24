@@ -88,24 +88,71 @@ class DeepSeekAdapter:
     """Adapter for DeepSeek Chat API"""
 
     def __init__(self, token: str = TOKEN, cookies: str = COOKIES):
-        self.token = token
+        self.token = self._normalize_token(token)
         self.cookies = cookies
         self._solver = None
         self._client = httpx.Client(timeout=120)
         self._msg_counters: dict[str, int] = {}
+        # Header set captured from a live Chrome 149 session against
+        # chat.deepseek.com (frontend commit 1300ef9f7, captured 2026-06-19).
+        # Names use the same casing the real browser sends.
         self._base_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {self.token}",
             "Cookie": cookies,
             "Origin": BASE_URL,
             "Referer": f"{BASE_URL}/",
-            "X-App-Version": "20241129.1",
+            "Priority": "u=1, i",
+            "Sec-Ch-Ua": (
+                '"Google Chrome";v="131", "Chromium";v="131", '
+                '"Not_A Brand";v="24"'
+            ),
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            # Application headers — values verified against the live frontend.
+            "X-App-Version": "2.0.0",
             "X-Client-Version": "2.0.0",
             "X-Client-Platform": "web",
             "X-Client-Locale": "zh_CN",
             "X-Client-Timezone-Offset": "28800",
+            "x-client-bundle-id": "com.deepseek.chat",
         }
+
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        """Accept either a bare token or DeepSeek's localStorage JSON wrapper.
+
+        DeepSeek stores its token in localStorage as
+            {"value":"<bare-token>","__version":"0"}
+        but the network layer sends only the bare value as
+            Authorization: Bearer <bare-token>
+        Users sometimes copy the localStorage form by mistake. Auto-unwrap
+        it so the adapter accepts either form.
+        """
+        if not token:
+            return token
+        s = token.strip()
+        if s.startswith("Bearer "):
+            s = s[len("Bearer "):].strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict) and "value" in obj and isinstance(obj["value"], str):
+                    return obj["value"]
+            except (ValueError, TypeError):
+                pass
+        return s
 
     @property
     def solver(self):
