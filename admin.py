@@ -3,6 +3,7 @@ Admin API — authentication, statistics tracking, account pool management.
 """
 import os
 import secrets
+import threading
 import time
 
 from fastapi import APIRouter, HTTPException, Request
@@ -22,7 +23,65 @@ def _generate_token() -> str:
 
 
 def _verify_token(token: str) -> bool:
-    return token in _tokens
+    if not token:
+        return False
+    # Constant-time membership: compare against every stored token. The set is
+    # small (one entry per active admin session) so the cost is negligible.
+    snapshot = tuple(_tokens)
+    matched = False
+    for stored in snapshot:
+        if secrets.compare_digest(token, stored):
+            matched = True
+    return matched
+
+
+# ── Login throttling ──────────────────────────────────────────
+# Per-IP sliding window: at most _LOGIN_MAX failures per _LOGIN_WINDOW seconds.
+_LOGIN_MAX = 5
+_LOGIN_WINDOW = 300
+_login_attempts: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    # Prefer X-Forwarded-For when behind a trusted proxy. The deployment guide
+    # warns against exposing /admin/api/login publicly without TLS, so this is
+    # best-effort identification, not a security boundary.
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _login_record_failure(ip: str) -> None:
+    now = time.time()
+    with _login_lock:
+        attempts = _login_attempts.setdefault(ip, [])
+        cutoff = now - _LOGIN_WINDOW
+        attempts[:] = [t for t in attempts if t > cutoff]
+        attempts.append(now)
+
+
+def _login_check_over_limit(ip: str) -> None:
+    """Raise 429 if this IP has too many recent failures.
+    Call AFTER recording the failure so the current attempt is counted."""
+    now = time.time()
+    with _login_lock:
+        attempts = _login_attempts.get(ip, [])
+        cutoff = now - _LOGIN_WINDOW
+        recent = [t for t in attempts if t > cutoff]
+        if len(recent) >= _LOGIN_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts; try again later",
+            )
+
+
+def _login_clear(ip: str) -> None:
+    with _login_lock:
+        _login_attempts.pop(ip, None)
 
 
 # ── Stats ─────────────────────────────────────────────────────
@@ -122,12 +181,30 @@ def _pool_error(e: Exception):
 
 
 @router.post("/login")
-async def login(req: LoginRequest):
-    if req.password != _ADMIN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Invalid password")
-    token = _generate_token()
-    _tokens.add(token)
-    return {"token": token}
+async def login(req: LoginRequest, request: Request):
+    ip = _client_ip(request)
+    # Constant-time compare so a wrong password and a right one take the
+    # same time. Throttle is checked AFTER the compare so a legitimate
+    # password resets the counter even if the IP was previously cooling
+    # down — typical SSH/GitHub semantics, prevents lockout-of-self.
+    correct = secrets.compare_digest(req.password or "", _ADMIN_PASSWORD or "")
+    if correct:
+        _login_clear(ip)
+        token = _generate_token()
+        _tokens.add(token)
+        return {"token": token}
+    _login_record_failure(ip)
+    _login_check_over_limit(ip)
+    raise HTTPException(status_code=403, detail="Invalid password")
+
+
+@router.post("/logout")
+async def logout(request: Request):
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token:
+        _tokens.discard(token)
+    return {"ok": True}
 
 
 @router.get("/stats")
