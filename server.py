@@ -680,16 +680,42 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
 # ── Admin & static file serving ──────────────────────────────
 
-_WEBUI_DIR = _os.path.join(_os.path.dirname(__file__), "webui")
+_WEBUI_DIR = _os.path.realpath(_os.path.join(_os.path.dirname(__file__), "webui"))
 
 app.include_router(admin_router)
+
+
+def _safe_webui_path(rest_of_path: str) -> str | None:
+    """Resolve a path inside the webui dir, refusing traversal.
+
+    Returns the absolute file path if it points to a file under _WEBUI_DIR,
+    otherwise None. Defends against `..\\..\\.env` style requests that would
+    otherwise let unauthenticated callers read project secrets.
+    """
+    if not rest_of_path:
+        return None
+    # Reject obviously hostile inputs early.
+    if "\x00" in rest_of_path:
+        return None
+    candidate = _os.path.realpath(_os.path.join(_WEBUI_DIR, rest_of_path))
+    try:
+        common = _os.path.commonpath([candidate, _WEBUI_DIR])
+    except ValueError:
+        # Different drives on Windows raise ValueError.
+        return None
+    if common != _WEBUI_DIR:
+        return None
+    if not _os.path.isfile(candidate):
+        return None
+    return candidate
+
 
 if _os.path.isdir(_WEBUI_DIR):
     @app.get("/webui/{rest_of_path:path}")
     async def webui_spa(rest_of_path: str):
-        file_path = _os.path.join(_WEBUI_DIR, rest_of_path) if rest_of_path else _WEBUI_DIR
-        if _os.path.isfile(file_path):
-            return FileResponse(file_path)
+        safe = _safe_webui_path(rest_of_path)
+        if safe is not None:
+            return FileResponse(safe)
         index = _os.path.join(_WEBUI_DIR, "index.html")
         if _os.path.isfile(index):
             return FileResponse(index)
