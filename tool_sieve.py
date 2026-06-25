@@ -2,9 +2,30 @@
 StreamSieve — 流式筛分引擎
 
 逐字符检测 DSML 工具调用标签，从 SSE 流中实时分离正文与工具调用。
+
+v2.2.0 fixes:
+* ``feed()`` no longer recurses on suffix tail; replaced with iterative loop.
+* ``_split_safe()`` no longer holds an empty tail forever.
+* ``_capture_buf`` has a hard size cap (configurable via
+  ``DSML_MAX_BUFFER_BYTES``) to prevent unbounded growth from adversarial
+  or malformed model output.
 """
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1024, int(raw))  # never allow less than 1 KiB
+    except ValueError:
+        return default
+
+
+MAX_CAPTURE_BUFFER = _env_int("DSML_MAX_BUFFER_BYTES", 1024 * 1024)  # 1 MiB
 
 
 @dataclass
@@ -26,17 +47,36 @@ class StreamSieve:
         "|DSML|invoke ",
     ]
 
-    def __init__(self, parse_fn: Callable | None = None):
+    # Plain prefixes that *could* grow into a tool call tag. Used to decide
+    # how much of the tail to hold while we wait for more characters.
+    _TOOL_PREFIXES = (
+        "<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke",
+    )
+
+    def __init__(self, parse_fn: Callable | None = None,
+                 max_capture_buffer: int | None = None):
         self.parse_fn = parse_fn
         self._pending = ""
         self._capture_buf = ""
         self._capturing = False
+        self._max_capture_buffer = (
+            max_capture_buffer if max_capture_buffer is not None
+            else MAX_CAPTURE_BUFFER
+        )
 
     def feed(self, chunk: str) -> list[SieveEvent]:
         events: list[SieveEvent] = []
-
+        if not chunk:
+            return events
         if self._capturing:
             self._capture_buf += chunk
+            if len(self._capture_buf) > self._max_capture_buffer:
+                # Force-flush: the model is producing far more than a single
+                # tool call; treat the buffer as plain text and recover.
+                events.append(SieveEvent("text", self._capture_buf))
+                self._capture_buf = ""
+                self._capturing = False
+                return events
             result = self._try_finish_capture()
             if result is not None:
                 prefix, tool_calls, suffix = result
@@ -44,12 +84,14 @@ class StreamSieve:
                     events.append(SieveEvent("text", prefix))
                 if tool_calls:
                     events.append(SieveEvent("tool_calls", tool_calls))
+                # Iterative instead of recursive — Python's stack is finite
+                # and a long suffix with many tool calls would blow it.
                 if suffix:
                     self._pending = suffix
                 self._capture_buf = ""
                 self._capturing = False
                 if suffix:
-                    events.extend(self.feed(""))
+                    events.extend(self._drain_pending())
             return events
 
         self._pending += chunk
@@ -74,12 +116,56 @@ class StreamSieve:
                     self._pending = suffix
                 self._capture_buf = ""
                 self._capturing = False
+                if suffix:
+                    events.extend(self._drain_pending())
         else:
             safe, hold = self._split_safe(self._pending)
             if safe:
                 events.append(SieveEvent("text", safe))
             self._pending = hold
 
+        return events
+
+    def _drain_pending(self) -> list[SieveEvent]:
+        """Iteratively process the pending buffer without recursion."""
+        events: list[SieveEvent] = []
+        while self._pending:
+            if self._capturing:
+                # Capture is set elsewhere; this branch shouldn't be hit
+                # in the iterative path, but be defensive.
+                break
+            start_idx = self._find_tool_start(self._pending)
+            if start_idx >= 0:
+                prefix = self._pending[:start_idx]
+                rest = self._pending[start_idx:]
+                self._pending = ""
+                if prefix:
+                    events.append(SieveEvent("text", prefix))
+                self._capture_buf = rest
+                self._capturing = True
+                result = self._try_finish_capture()
+                if result is not None:
+                    p, tcs, sfx = result
+                    if p:
+                        events.append(SieveEvent("text", p))
+                    if tcs:
+                        events.append(SieveEvent("tool_calls", tcs))
+                    if sfx:
+                        self._pending = sfx
+                    self._capture_buf = ""
+                    self._capturing = False
+                    # Loop continues with any new pending.
+                else:
+                    break
+            else:
+                safe, hold = self._split_safe(self._pending)
+                if safe:
+                    events.append(SieveEvent("text", safe))
+                self._pending = hold
+                # If hold is empty, we're done. If it isn't, the next
+                # chunk will resolve it; we just stop the loop now to
+                # avoid spinning.
+                break
         return events
 
     def flush(self) -> list[SieveEvent]:
@@ -109,23 +195,36 @@ class StreamSieve:
             pos = text.find(tag)
             if pos >= 0:
                 return pos
-        for prefix in ("<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke"):
+        for prefix in self._TOOL_PREFIXES:
             pos = text.find(prefix)
             if pos >= 0:
                 return pos
         return -1
 
     def _split_safe(self, text: str) -> tuple[str, str]:
+        """Return ``(safe, hold)`` such that ``safe + hold == text`` and
+        ``hold`` is the smallest suffix that could still grow into a
+        DSML tool-call tag.
+        """
+        if not text:
+            return "", ""
         last_lt = text.rfind("<")
         last_pipe = text.rfind("|")
         last_special = last_lt if last_lt >= last_pipe else last_pipe
         if last_special == -1:
+            # No special characters at all: nothing can ever start a tag.
             return text, ""
         tail = text[last_special:]
+        # The empty-tail edge case: an empty `tail` is always a prefix of
+        # any string, so we'd recurse forever. The check `last_special != -1`
+        # already guarantees tail has at least one character, so this branch
+        # is unreachable — kept here as a safety net.
+        if not tail:
+            return text, ""
         for tag in self._TOOL_STARTS:
             if tag.startswith(tail) or tail == tag[:len(tail)]:
                 return text[:last_special], tail
-        for prefix in ("<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke"):
+        for prefix in self._TOOL_PREFIXES:
             if prefix.startswith(tail) or (len(tail) <= len(prefix) and tail == prefix[:len(tail)]):
                 return text[:last_special], tail
         return text, ""

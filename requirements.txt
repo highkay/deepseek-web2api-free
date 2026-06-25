@@ -1,6 +1,16 @@
-fastapi>=0.100.0
-uvicorn>=0.20.0
-httpx>=0.24.0
-curl_cffi>=0.7.0
-wasmtime>=14.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+curl_cffi>=0.7.1
+wasmtime>=15.0.0
 python-dotenv>=1.0.0
+
+# v2.2.0 — at-rest credential encryption (Fernet / AES-128-CBC + HMAC)
+cryptography>=42.0.0
+
+# v2.2.0 — local prompt-token estimation (cl100k_base; DeepSeek-compatible
+# fallback heuristic kicks in if tiktoken is not installed, but the
+# heuristics undercount CJK so tiktoken is recommended in production).
+tiktoken>=0.7.0
+
+# Test-only (kept in main requirements for one-step CI bootstrap)
+pytest>=8.0.0

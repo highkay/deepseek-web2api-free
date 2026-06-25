@@ -267,12 +267,22 @@ def build_nonstream_response(
     msg_id: str, model: str,
     content_text: str | None,
     tool_calls: list[dict] | None = None,
-    need_thinking_content: bool = False,
+    thinking_text: str | None = None,
 ) -> dict:
-    """Build Anthropic non-streaming response dict."""
+    """Build Anthropic non-streaming response dict.
+
+    Order of content blocks follows Anthropic's convention:
+      1. ``thinking`` (if any) — appears first when expert mode was used.
+      2. ``text`` (if any)
+      3. ``tool_use`` blocks (if any)
+
+    The previous version accepted a ``need_thinking_content`` flag but
+    never actually returned thinking. The thinking text is now passed
+    explicitly via ``thinking_text`` from the caller.
+    """
     content = []
-    if need_thinking_content:
-        pass  # non-streaming doesn't return thinking from current adapter.chat()
+    if thinking_text:
+        content.append({"type": "thinking", "thinking": thinking_text})
     if content_text:
         content.append({"type": "text", "text": content_text})
     if tool_calls:

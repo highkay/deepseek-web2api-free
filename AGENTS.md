@@ -4,6 +4,20 @@
 
 ---
 
+## v2.2.0 变更摘要（2026-06）
+
+新增模块：`logger.py`、`crypto.py`、`ip_utils.py`、`token_counter.py`、
+`rate_limiter.py`、`model_router.py`、`session_cache.py`。
+
+主要变化：
+
+- **安全**：默认 `HOST=127.0.0.1`；公网 + 默认密码启动时 `SystemExit(2)`；结构化 JSON 日志；`data/accounts.json` 可选 Fernet 加密（启动时透明迁移）；CORS 严格化（空 = 同源）；XFF 白名单 (`TRUSTED_PROXIES`)；安全响应头。
+- **Bug**：`adapter.chat()` 现在返回 `(content, thinking)` 元组；`anthropic_format.build_nonstream_response` 接收 `thinking_text`；`StreamSieve` 改为迭代式排空、`feed("")` 递归被替换为 `while`、捕获缓冲硬上限 1 MB（可配置 `DSML_MAX_BUFFER_BYTES`）；账号错误达到 3 次后自动后台 `check_health` 恢复。
+- **新功能**：`MODEL_ROUTES` 模型路由；`SESSION_CACHE_TTL` 多轮会话（OpenAI `X-Conversation-Id` 头 / Anthropic `metadata.user_id` / 消息摘要 fallback）；`CLIENT_RPM_PER_KEY` / `CLIENT_RPM_PER_IP` 双维度滑动窗口限流；`usage` 字段返回真实 token 数（tiktoken cl100k_base，缺失时字符启发式）；`/admin/api/stats` 增加 p50/p95/p99 + 成功率。
+- **工程化**：`tests/test_*.py` 56 个 pytest 用例；CI 矩阵 (3.10/3.11/3.12)；SSE 错误帧（OpenAI 流末尾发 `data: {"error":...}` 后 `data: [DONE]`）替代直接抛 500。
+
+---
+
 ## 目录
 
 1. [项目概述](#1-项目概述)

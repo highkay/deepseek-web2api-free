@@ -18,12 +18,32 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from adapter import DeepSeekAdapter
+from crypto import (
+    is_enabled as crypto_is_enabled,
+    encrypt_account_dict,
+    decrypt_account_dict,
+    detect_store_version,
+    STORE_VERSION_ENCRYPTED,
+    STORE_VERSION_PLAIN,
+    maybe_upgrade_store_file,
+)
+from logger import get_logger
 
 load_dotenv()
 
+log = get_logger("account_pool")
 
 STORE_VERSION = 1
 DEFAULT_STORE_PATH = Path(__file__).resolve().parent / "data" / "accounts.json"
+
+# Auto-recovery: when an account has accumulated this many errors,
+# schedule a background health check to clear the error state if the
+# upstream is reachable again. Set to 0 to disable (every error is
+# permanent until manual relogin).
+_RECOVER_ERROR_THRESHOLD = 3
+_RECOVER_FLAG_DISABLED = os.environ.get("DISABLE_AUTO_RECOVER", "").lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 def _now() -> int:
@@ -136,7 +156,7 @@ class AccountPool:
 
     def _append_loaded(self, acct: Account):
         if any(a.fingerprint == acct.fingerprint for a in self._accounts):
-            print(f"WARNING: Skipping duplicate DeepSeek account {acct.email or acct.id}")
+            log.warning("skipping_duplicate_account", extra={"email": acct.email, "id": acct.id})
             return
         self._accounts.append(acct)
 
@@ -147,14 +167,29 @@ class AccountPool:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
-            print(f"WARNING: Failed to load account store {path}: {e}")
+            log.warning("failed_to_load_account_store", extra={"path": str(path), "error": str(e)})
             return
 
+        version = detect_store_version(data)
+        if version == STORE_VERSION_ENCRYPTED and not crypto_is_enabled():
+            log.error("encrypted_store_without_key", extra={"path": str(path)})
+            return
+
+        # If we're encrypted, rewrite the file as v2 in place (one-shot migration).
+        if version == STORE_VERSION_PLAIN and crypto_is_enabled():
+            try:
+                maybe_upgrade_store_file(path)
+                log.info("upgraded_account_store_to_encrypted", extra={"path": str(path)})
+            except Exception as e:
+                log.warning("account_store_upgrade_failed", extra={"path": str(path), "error": str(e)})
+
         for item in data.get("accounts", []):
+            # Decrypt in-memory copy if v2.
+            item = decrypt_account_dict(item) if version == STORE_VERSION_ENCRYPTED else item
             token = str(item.get("token") or "").strip()
             cookies = str(item.get("cookies") or "").strip()
             if not token or not cookies:
-                print("WARNING: Skipping persisted account with missing token/cookies")
+                log.warning("skipping_account_missing_credentials", extra={"id": item.get("id")})
                 continue
             created_at = int(item.get("created_at") or _now())
             updated_at = int(item.get("updated_at") or created_at)
@@ -203,7 +238,7 @@ class AccountPool:
                 source="env",
             ))
         elif token or cookies:
-            print("WARNING: Skipping legacy env account: DEEPSEEK_TOKEN and DEEPSEEK_COOKIES must both be set")
+            log.warning("skipping_legacy_env_account_incomplete")
 
     def _ensure_store_dir(self):
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,10 +246,21 @@ class AccountPool:
 
     def _save_persisted_accounts_locked(self):
         self._ensure_store_dir()
-        data = {
-            "version": STORE_VERSION,
-            "accounts": [a.to_store_dict() for a in self._accounts if a.source == "file"],
-        }
+        if crypto_is_enabled():
+            accounts = [
+                encrypt_account_dict(a.to_store_dict())
+                for a in self._accounts if a.source == "file"
+            ]
+            data = {
+                "version": STORE_VERSION_ENCRYPTED,
+                "encryption": "fernet",
+                "accounts": accounts,
+            }
+        else:
+            data = {
+                "version": STORE_VERSION_PLAIN,
+                "accounts": [a.to_store_dict() for a in self._accounts if a.source == "file"],
+            }
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
         fd, tmp_name = tempfile.mkstemp(
@@ -355,10 +401,48 @@ class AccountPool:
                 acct.state = "idle"
 
     def mark_error(self, acct: Account, error_msg: str = ""):
+        """Mark an account as `error`. If it has failed too many times, schedule
+        a background health check to see if the credentials have come back
+        (e.g. WAF challenge window expired, IP block lifted). The threshold
+        is intentionally low so that transient blips heal automatically.
+        """
         with self._lock:
             acct.state = "error"
             acct.error_count += 1
             acct.last_error = error_msg
+            should_recover = acct.error_count >= _RECOVER_ERROR_THRESHOLD
+
+        if should_recover and not _RECOVER_FLAG_DISABLED:
+            # Run the health check on a background thread so the request
+            # thread isn't blocked. We don't wait for the result; acquire()
+            # will see the new state next time.
+            t = threading.Thread(
+                target=self._background_recover,
+                args=(acct,),
+                daemon=True,
+            )
+            t.start()
+
+    def _background_recover(self, acct: Account) -> None:
+        try:
+            ok = self.check_health(acct)
+            log.info(
+                "background_recover_finished",
+                extra={"id": acct.id, "ok": ok, "error": acct.last_error},
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "background_recover_crashed",
+                extra={"id": acct.id, "error": str(e)},
+            )
+
+    def mark_recovered(self, acct: Account) -> None:
+        """Public hook: reset error counters and return to idle."""
+        with self._lock:
+            acct.state = "idle"
+            acct.error_count = 0
+            acct.last_error = ""
+            acct._adapter = None
 
     # ── Health check / relogin ─────────────────────────────────
 
@@ -386,11 +470,7 @@ class AccountPool:
 
         ok = self.check_health(acct)
         if ok:
-            with self._lock:
-                acct.state = "idle"
-                acct.error_count = 0
-                acct.last_error = ""
-                acct._adapter = None
+            self.mark_recovered(acct)
             return True, "ok"
         return False, acct.last_error or "unknown error"
 

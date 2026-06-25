@@ -27,8 +27,6 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install only the deps required by the smoke test.
-          # `httpx` is the TestClient transport and is already a runtime dep.
           python -m pip install -r requirements.txt
 
       - name: Run smoke test
@@ -38,3 +36,69 @@ jobs:
         # that the webui path-traversal fix holds.
         run: |
           python -m tests.smoke
+
+  unit:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/test_sieve.py \
+                          tests/test_dsml.py \
+                          tests/test_token_counter.py \
+                          tests/test_session_cache.py \
+                          tests/test_model_router.py \
+                          tests/test_rate_limiter.py \
+                          tests/test_ip_utils.py \
+                          -v --tb=short
+
+  e2e:
+    name: End-to-end validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [smoke, unit]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run end-to-end checks
+        # Each scenario runs in its own sub-process because the server
+        # module caches env-var values at import time, and importlib.reload
+        # does not refresh `from admin import is_admin_password_weak`
+        # bindings — so we re-launch a fresh interpreter per scenario.
+        run: |
+          python scripts/run_e2e.py

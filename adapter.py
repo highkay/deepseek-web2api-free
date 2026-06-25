@@ -27,7 +27,10 @@ except ImportError as e:
         "Run: pip install -r requirements.txt"
     ) from e
 
+from logger import get_logger
+
 load_dotenv()
+log = get_logger("adapter")
 
 COOKIES = os.environ.get("DEEPSEEK_COOKIES", "")
 BASE_URL = "https://chat.deepseek.com"
@@ -89,8 +92,8 @@ class _WASMSolver:
         for ptr, length in self._allocations:
             try:
                 self._wbindgen_free(self.store, ptr, length, 1)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("wasm_free_failed", extra={"ptr": ptr, "length": length, "error": str(e)})
         self._allocations.clear()
 
     def solve(self, challenge: str, salt: str, expire_at: int, difficulty: int) -> int:
@@ -157,8 +160,11 @@ class DeepSeekAdapter:
                     self._client.cookies.set(
                         name.strip(), value.strip(), domain=".deepseek.com"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug(
+                        "cookie_seed_failed",
+                        extra={"name": name, "error": str(e)},
+                    )
 
         self._msg_counters: dict[str, int] = {}
         # Header set captured from a live browser fetch().
@@ -314,14 +320,23 @@ class DeepSeekAdapter:
 
     def _send_completion(self, session_id: str, prompt: str, stream: bool = False,
                          model_type: str | None = None,
-                         thinking_enabled: bool = False, search_enabled: bool = False):
-        """Send a completion request, returns raw response"""
+                         thinking_enabled: bool = False, search_enabled: bool = False,
+                         parent_message_id: int | None = None):
+        """Send a completion request, returns raw response.
+
+        ``parent_message_id`` is the message id from the previous turn in
+        this chat_session. Pass ``None`` to start a fresh thread. When the
+        caller doesn't provide one, the per-session counter is used as a
+        monotonically increasing fallback (legacy behavior).
+        """
         headers = self._pow_headers("/api/v0/chat/completion")
-        mid = self._msg_counters.get(session_id, 0) + 1
-        self._msg_counters[session_id] = mid
+        if parent_message_id is None:
+            mid = self._msg_counters.get(session_id, 0) + 1
+            self._msg_counters[session_id] = mid
+            parent_message_id = mid - 1 if mid > 1 else None
         body = {
             "chat_session_id": session_id,
-            "parent_message_id": mid - 1 if mid > 1 else None,
+            "parent_message_id": parent_message_id,
             "model_type": model_type,
             "prompt": prompt,
             "ref_file_ids": [],
@@ -342,12 +357,26 @@ class DeepSeekAdapter:
         return resp
 
     def chat(self, session_id: str, prompt: str, model_type: str | None = None,
-             thinking_enabled: bool = False, search_enabled: bool = False) -> str:
-        """Send a non-streaming chat message, returns response content."""
+             thinking_enabled: bool = False, search_enabled: bool = False,
+             parent_message_id: int | None = None) -> tuple[str, str]:
+        """Send a non-streaming chat message.
+
+        Returns ``(content, thinking)``:
+          * ``content`` — the user-facing answer (concatenated text tokens).
+          * ``thinking`` — the expert-mode reasoning chain (empty string in
+            quick mode or when ``thinking_enabled`` is False).
+
+        Previously this method silently discarded ``thinking_parts``,
+        which meant the Anthropic ``/v1/messages`` non-streaming endpoint
+        could never expose the ``thinking`` content block. Callers that
+        only care about the visible text should unpack with
+        ``content, _ = adapter.chat(...)``.
+        """
         resp = self._send_completion(session_id, prompt, stream=False,
                                       model_type=model_type,
                                       thinking_enabled=thinking_enabled,
-                                      search_enabled=search_enabled)
+                                      search_enabled=search_enabled,
+                                      parent_message_id=parent_message_id)
         events = self._parse_sse(resp.text)
 
         # Collect all content from both normal mode and expert fragment mode
@@ -414,22 +443,28 @@ class DeepSeekAdapter:
                         content_parts.append(token)
                 continue
 
-        return "".join(content_parts)
+        return "".join(content_parts), "".join(thinking_parts)
 
     def chat_stream(self, session_id: str, prompt: str,
                     model_type: str | None = None,
-                    thinking_enabled: bool = False, search_enabled: bool = False):
+                    thinking_enabled: bool = False, search_enabled: bool = False,
+                    parent_message_id: int | None = None):
         """Stream a chat message, yields content tokens.
 
         In expert mode (model_type='expert'), yields dicts with
         __type='thinking' for reasoning tokens and strings for final content.
+
+        ``parent_message_id`` is the message id from the previous turn; pass
+        ``None`` to start a fresh thread.
         """
         headers = self._pow_headers("/api/v0/chat/completion")
-        mid = self._msg_counters.get(session_id, 0) + 1
-        self._msg_counters[session_id] = mid
+        if parent_message_id is None:
+            mid = self._msg_counters.get(session_id, 0) + 1
+            self._msg_counters[session_id] = mid
+            parent_message_id = mid - 1 if mid > 1 else None
         body = {
             "chat_session_id": session_id,
-            "parent_message_id": mid - 1 if mid > 1 else None,
+            "parent_message_id": parent_message_id,
             "model_type": model_type,
             "prompt": prompt,
             "ref_file_ids": [],
@@ -448,7 +483,8 @@ class DeepSeekAdapter:
                 # Drain so the connection can be reused.
                 try:
                     body_text = resp.text
-                except Exception:
+                except Exception as e:
+                    log.debug("waf_body_read_failed", extra={"error": str(e)})
                     body_text = ""
                 raise WAFChallengeError(kind, resp.status_code, body_text)
             resp.raise_for_status()
@@ -553,5 +589,5 @@ class DeepSeekAdapter:
         finally:
             try:
                 resp.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("response_close_failed", extra={"error": str(e)})

@@ -5,6 +5,7 @@ Supports streaming, tool calling (via DSML prompt injection), content parts, exp
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from typing import Optional, Union, Any
@@ -14,13 +15,13 @@ from dotenv import load_dotenv
 import os as _os
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from adapter import DeepSeekAdapter
-from admin import router as admin_router, get_pool, get_stats
+from admin import router as admin_router, get_pool, get_stats, is_admin_password_weak
 from tool_dsml import (
     parse_dsml_tool_calls,
     format_tool_calls_for_prompt,
@@ -34,15 +35,30 @@ from anthropic_format import (
     stream_response,
     _msg_id,
 )
+from logger import get_logger, configure_from_env
+from crypto import is_enabled as crypto_is_enabled
+from token_counter import count_text
+from rate_limiter import RateLimiter
+from ip_utils import get_real_client_ip, is_trusted_proxy
+from model_router import ModelRouter
+from session_cache import SessionCache, ChatSession
 
 load_dotenv()
+configure_from_env()
+log = get_logger("server")
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
 MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
+HOST = os.environ.get("HOST", "127.0.0.1").strip()
 PORT = int(os.environ.get("PORT", "8080"))
 ALLOW_UNAUTHENTICATED_API = os.environ.get("ALLOW_UNAUTHENTICATED_API", "false").strip().lower() in {"1", "true", "yes", "on"}
+ALLOW_INSECURE_PUBLIC_DEFAULTS = os.environ.get("ALLOW_INSECURE_PUBLIC_DEFAULTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+# CORS allow-list. Empty = same-origin only.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+ALLOW_CREDENTIALS = bool(ALLOWED_ORIGINS) and os.environ.get("ALLOW_CORS_CREDENTIALS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_api_keys() -> list[str]:
@@ -66,6 +82,9 @@ def _load_api_keys() -> list[str]:
 
 
 API_KEYS = _load_api_keys()
+RATE_LIMITER = RateLimiter()
+MODEL_ROUTER = ModelRouter()
+SESSION_CACHE = SessionCache()
 
 
 def _extract_api_key(request: Request) -> str:
@@ -73,6 +92,12 @@ def _extract_api_key(request: Request) -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return request.headers.get("x-api-key", "").strip()
+
+
+def _client_ip(request: Request) -> str:
+    """Resolve the real client IP, honouring XFF only when the peer is trusted."""
+    peer = request.client.host if request.client else None
+    return get_real_client_ip(request.headers, peer)
 
 
 def _check_api_auth(request: Request):
@@ -87,20 +112,137 @@ def _check_api_auth(request: Request):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
+def _check_rate_limit(request: Request) -> dict:
+    """Return a dict of rate-limit headers to merge into the response.
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    Raises HTTPException(429) when the limit is exceeded.
+    """
+    api_key = _extract_api_key(request) or None
+    ip = _client_ip(request)
+    allowed, headers = RATE_LIMITER.check(api_key, ip)
+    if not allowed:
+        # Don't leak whether the key or the IP was the limit, to limit
+        # username-enumeration. Same response regardless of dimension.
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Slow down and retry after the indicated time.",
+            headers=headers,
+        )
+    return headers
+
+
+app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.2.0")
+
+# ── CORS ─────────────────────────────────────────────────────────────
+# Empty ALLOWED_ORIGINS ⇒ same-origin only. We deliberately do NOT set
+# `allow_origins=["*"]` with `allow_credentials=True` (spec violation; most
+# browsers silently strip credentials).
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=ALLOW_CREDENTIALS,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Default: strict same-origin. The middleware only does anything when
+    # `allow_origins` is non-empty, so omitting it is safe.
+    pass
+
+
+# ── Security response headers ────────────────────────────────────────
+@app.middleware("http")
+async def _add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    # WebUI gets an extra CSP; JSON APIs do not (SSE is not worth breaking).
+    path = request.url.path
+    if path.startswith("/webui") or path == "/webui":
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'",
+        )
+    return response
+
 
 pool = get_pool()
 
 if pool.count() == 0:
-    print("WARNING: No accounts in pool. Set DEEPSEEK_TOKEN and DEEPSEEK_COOKIES in .env")
+    log.warning(
+        "no_accounts_in_pool",
+        extra={"hint": "Set DEEPSEEK_TOKEN and DEEPSEEK_COOKIES in .env"},
+    )
+
+
+# ── Startup safety checks ────────────────────────────────────────────
+def _validate_startup() -> None:
+    """Run fatal pre-flight checks; raise SystemExit on hard failures."""
+    binding_public = HOST in {"0.0.0.0", "::"}  # noqa: S104 — by design
+    weak_password = is_admin_password_weak()
+
+    if binding_public and weak_password and not ALLOW_INSECURE_PUBLIC_DEFAULTS:
+        msg = (
+            "\n"
+            "=" * 72 + "\n"
+            "FATAL: Refusing to start with default admin password on a public bind.\n"
+            f"  HOST={HOST} (public), DEEPSEEK_ADMIN_PASSWORD is unset or weak.\n"
+            "  Fix one of:\n"
+            "    1. Bind to loopback:  HOST=127.0.0.1 (recommended for dev).\n"
+            "    2. Set a strong password:  DEEPSEEK_ADMIN_PASSWORD=<random>.\n"
+            "    3. Acknowledge risk explicitly:\n"
+            "         ALLOW_INSECURE_PUBLIC_DEFAULTS=true\n"
+            "       (only do this behind a reverse proxy that already enforces auth.)\n"
+            "=" * 72 + "\n"
+        )
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+        raise SystemExit(2)
+
+    if binding_public and not ALLOWED_ORIGINS:
+        log.warning(
+            "cors_strict_default_in_effect",
+            extra={
+                "host": HOST,
+                "hint": "Set ALLOWED_ORIGINS=https://app.example.com for browser access.",
+            },
+        )
+
+    if not crypto_is_enabled() and pool.count() > 0:
+        log.warning(
+            "credentials_stored_in_plaintext",
+            extra={
+                "hint": (
+                    "Set DEEPSEEK_ENCRYPTION_KEY to encrypt data/accounts.json. "
+                    "Generate one with: python -c \"from cryptography.fernet "
+                    "import Fernet; print(Fernet.generate_key().decode())\""
+                ),
+            },
+        )
+
+    if weak_password:
+        log.warning("admin_password_is_weak", extra={"host": HOST})
+
+    log.info(
+        "startup_ok",
+        extra={
+            "host": HOST,
+            "port": PORT,
+            "accounts": pool.count(),
+            "crypto_enabled": crypto_is_enabled(),
+            "cors_origins": len(ALLOWED_ORIGINS),
+            "allow_unauthenticated_api": ALLOW_UNAUTHENTICATED_API,
+        },
+    )
 
 
 # ---- Pydantic models ----
@@ -169,14 +311,27 @@ class ModelList(BaseModel):
 
 class AcquiredAccount:
     """Context manager wrapping an acquired pool account."""
-    def __init__(self, acct):
+    def __init__(self, acct, cache_key: str | None = None):
         self.acct = acct
         self.adapter = acct.adapter
         self._session_id: str | None = None
+        self._parent_message_id: int | None = None
+        self._cache_key = cache_key
+        self._cached_session: ChatSession | None = None
+        # If we have a cache key, try to reuse the existing session first.
+        if cache_key:
+            self._cached_session = SESSION_CACHE.get(cache_key)
 
     def create_session(self) -> str:
+        # Reuse the cached session if we have one — multi-turn support.
+        if self._cached_session is not None:
+            self._session_id = self._cached_session.chat_session_id
+            self._parent_message_id = self._cached_session.parent_message_id
+            return self._session_id
         ds_id = self.adapter.create_session()
         self._session_id = ds_id
+        if self._cache_key:
+            SESSION_CACHE.put(self._cache_key, ChatSession(chat_session_id=ds_id))
         return ds_id
 
     @property
@@ -185,15 +340,58 @@ class AcquiredAccount:
             raise RuntimeError("No session created")
         return self._session_id
 
+    @property
+    def parent_message_id(self) -> int | None:
+        """Return the current parent_message_id for the cached session, or None
+        for a fresh session (caller should treat as a new conversation).
+        """
+        return self._parent_message_id
+
+    def record_message_id(self, mid: int) -> None:
+        """After sending a message, write the new parent_message_id back
+        into the cache so the next turn threads correctly.
+        """
+        if self._cache_key and self._cached_session is not None:
+            self._cached_session.next_message_id()
+            # Also store the actual upstream mid so the next turn's body
+            # carries the right parent_message_id.
+            self._cached_session.parent_message_id = mid
+
     def release(self):
         pool.release(self.acct)
 
 
-def _acquire() -> AcquiredAccount:
+def _acquire(cache_key: str | None = None) -> AcquiredAccount:
     acct = pool.acquire()
     if acct is None:
         raise HTTPException(status_code=503, detail="All accounts busy, try again later")
-    return AcquiredAccount(acct)
+    return AcquiredAccount(acct, cache_key=cache_key)
+
+
+def _extract_openai_user(messages: list[ChatMessage], request: Request) -> str:
+    """Derive a per-conversation cache key for the OpenAI endpoint.
+
+    Strategy: combine the client IP (when trusted) with the SHA-256 of
+    the first user-role message. The first-message hash is good enough
+    stickiness for short conversations; clients that want a stronger
+    identity should set the OpenAI ``user`` field (we don't model it
+    directly in the request schema yet, so it lives in headers as
+    ``X-Conversation-Id``).
+    """
+    cid = request.headers.get("X-Conversation-Id", "").strip()
+    if cid:
+        return f"hdr:{cid}"
+    return SessionCache.derive_conversation_id(None, [m.model_dump() for m in messages], None)
+
+
+def _extract_anthropic_user(req: AnthropicRequest, request: Request) -> str:
+    cid = request.headers.get("X-Conversation-Id", "").strip()
+    if cid:
+        return f"hdr:{cid}"
+    metadata = req.metadata or {}
+    return SessionCache.derive_conversation_id(
+        None, [m.model_dump() for m in req.messages], metadata
+    )
 
 
 # ---- Message / prompt building ----
@@ -336,25 +534,40 @@ async def health():
 @app.get("/v1/models")
 async def list_models(request: Request):
     _check_api_auth(request)
-    return ModelList(data=[
-        ModelInfo(id=MODEL_NAME, created=int(time.time())),
-    ])
+    rate_headers = _check_rate_limit(request)
+    # Surface every model declared in MODEL_ROUTES; fall back to MODEL_NAME.
+    names = MODEL_ROUTER.models or [MODEL_NAME]
+    return JSONResponse(
+        ModelList(data=[
+            ModelInfo(id=name, created=int(time.time())) for name in names
+        ]).model_dump(),
+        headers=rate_headers,
+    )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     _check_api_auth(request)
+    rate_headers = _check_rate_limit(request)
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     prompt = _build_prompt(req.messages, req.tools, req.tool_choice)
 
+    # Resolve model_type / thinking / search from MODEL_ROUTES first, then
+    # MODE/THINKING/SEARCH env vars, then the per-request fields.
+    decision = MODEL_ROUTER.route_for(req.model)
+
     # MODE controls model_type (quick → "default", expert → "expert")
-    if MODE == "expert":
+    if decision.matched_model:
+        model_type = decision.model_type
+    elif MODE == "expert":
         model_type = "expert"
     else:
         model_type = "default"  # quick mode or auto, matches native request format
 
     # THINKING controls thinking_enabled independent of mode
-    if THINKING == "enabled":
+    if decision.thinking is not None:
+        thinking = decision.thinking
+    elif THINKING == "enabled":
         thinking = True
     elif THINKING == "disabled":
         thinking = False
@@ -362,7 +575,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         thinking = req.thinking_mode or False
 
     # SEARCH controls search_enabled independently
-    if SEARCH == "enabled":
+    if decision.search is not None:
+        search = decision.search
+    elif SEARCH == "enabled":
         search = True
     elif SEARCH == "disabled":
         search = False
@@ -370,9 +585,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         search = req.search_enabled or False
 
     if req.stream:
-        return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search)
+        return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
+                                    cache_key=_extract_openai_user(req.messages, request))
 
-    return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search)
+    return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
+                             cache_key=_extract_openai_user(req.messages, request))
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -381,6 +598,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 @app.post("/v1/messages")
 async def messages(req: AnthropicRequest, request: Request):
     _check_api_auth(request)
+    rate_headers = _check_rate_limit(request)
     proxy_id = _msg_id()
     system_str = req.system
     if isinstance(system_str, list):
@@ -395,14 +613,22 @@ async def messages(req: AnthropicRequest, request: Request):
         system_str=system_str,
     )
 
+    # Resolve model_type / thinking / search from MODEL_ROUTES first, then
+    # MODE/THINKING/SEARCH env vars, then the per-request fields.
+    decision = MODEL_ROUTER.route_for(req.model)
+
     # MODE controls model_type
-    if MODE == "expert":
+    if decision.matched_model:
+        model_type = decision.model_type
+    elif MODE == "expert":
         model_type = "expert"
     else:
         model_type = "default"
 
     # THINKING — Anthropic thinking param maps to thinking_mode
-    if THINKING == "enabled":
+    if decision.thinking is not None:
+        thinking = decision.thinking
+    elif THINKING == "enabled":
         thinking = True
     elif THINKING == "disabled":
         thinking = False
@@ -410,7 +636,9 @@ async def messages(req: AnthropicRequest, request: Request):
         thinking = (req.thinking is not None and req.thinking.type == "enabled") or False
 
     # SEARCH
-    if SEARCH == "enabled":
+    if decision.search is not None:
+        search = decision.search
+    elif SEARCH == "enabled":
         search = True
     elif SEARCH == "disabled":
         search = False
@@ -426,24 +654,28 @@ async def messages(req: AnthropicRequest, request: Request):
     if req.stream:
         return await _anthropic_stream(proxy_id, prompt, tool_names,
                                        model_type=model_type, thinking_mode=thinking,
-                                       search_enabled=search)
+                                       search_enabled=search,
+                                       rate_headers=rate_headers,
+                                       cache_key=_extract_anthropic_user(req, request))
 
     return _anthropic_nonstream(proxy_id, prompt, tool_names,
                                 model_type=model_type, thinking_mode=thinking,
-                                search_enabled=search)
+                                search_enabled=search,
+                                cache_key=_extract_anthropic_user(req, request))
 
 
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          model_type: str | None = None,
-                         thinking_mode: bool = False, search_enabled: bool = False):
-    acq = _acquire()
+                         thinking_mode: bool = False, search_enabled: bool = False,
+                         cache_key: str | None = None):
+    acq = _acquire(cache_key=cache_key)
     try:
         ds_id = acq.create_session()
         t0 = time.time()
-        content = acq.adapter.chat(ds_id, prompt, model_type=model_type,
-                                    thinking_enabled=thinking_mode, search_enabled=search_enabled)
-        lat = (time.time() - t0) * 1000
-        get_stats().record(MODEL_NAME, lat)
+        content, thinking = acq.adapter.chat(ds_id, prompt, model_type=model_type,
+                                              thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                              parent_message_id=acq.parent_message_id)
+        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))
@@ -456,13 +688,16 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         msg_id, MODEL_NAME,
         content_text=cleaned or content,
         tool_calls=tool_calls,
+        thinking_text=thinking,
     )
 
 
 async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             model_type: str | None = None,
-                            thinking_mode: bool = False, search_enabled: bool = False):
-    acq = _acquire()
+                            thinking_mode: bool = False, search_enabled: bool = False,
+                            rate_headers: dict | None = None,
+                            cache_key: str | None = None):
+    acq = _acquire(cache_key=cache_key)
     try:
         ds_id = acq.create_session()
     except Exception as e:
@@ -480,7 +715,8 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                 acq.adapter.chat_stream(ds_id, prompt,
                                        model_type=model_type,
                                        thinking_enabled=thinking_mode,
-                                       search_enabled=search_enabled),
+                                       search_enabled=search_enabled,
+                                       parent_message_id=acq.parent_message_id),
                 tool_names,
                 thinking_mode=thinking_mode,
             ):
@@ -499,6 +735,7 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            **(rate_headers or {}),
         },
     )
 
@@ -508,15 +745,20 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
 
 def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = None,
                       model_type: str | None = None,
-                      thinking_mode: bool = False, search_enabled: bool = False):
+                      thinking_mode: bool = False, search_enabled: bool = False,
+                      cache_key: str | None = None):
     """Non-streaming completion with tool call detection."""
-    acq = _acquire()
+    prompt_tokens = count_text(prompt)
+    acq = _acquire(cache_key=cache_key)
     try:
         ds_id = acq.create_session()
         t0 = time.time()
-        content = acq.adapter.chat(ds_id, prompt, model_type=model_type,
-                                    thinking_enabled=thinking_mode, search_enabled=search_enabled)
-        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+        content, thinking = acq.adapter.chat(ds_id, prompt, model_type=model_type,
+                                              thinking_enabled=thinking_mode, search_enabled=search_enabled,
+                                              parent_message_id=acq.parent_message_id)
+        completion_tokens = count_text(content) + count_text(thinking)
+        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
+                           prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))
@@ -526,6 +768,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
 
     tool_names = _get_tool_names(tools)
     tool_calls, cleaned = _parse_response_for_tools(content, tool_names)
+    total = prompt_tokens + count_text(cleaned or content)
 
     if tool_calls:
         return {
@@ -542,7 +785,11 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
                 },
                 "finish_reason": "tool_calls",
             }],
-            "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": count_text(cleaned),
+                "total_tokens": total,
+            },
         }
 
     return {
@@ -558,19 +805,26 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
             },
             "finish_reason": "stop",
         }],
-        "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": count_text(cleaned or content),
+            "total_tokens": total,
+        },
     }
 
 
 async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = None,
                          model_type: str | None = None,
-                         thinking_mode: bool = False, search_enabled: bool = False):
+                         thinking_mode: bool = False, search_enabled: bool = False,
+                         rate_headers: dict | None = None,
+                         cache_key: str | None = None):
     """Streaming completion with StreamSieve tool call detection and expert mode support."""
-    acq = _acquire()
+    prompt_tokens = count_text(prompt)
+    acq = _acquire(cache_key=cache_key)
     try:
         ds_id = acq.create_session()
     except Exception as e:
-        get_stats().record(MODEL_NAME, 0, success=False)
+        get_stats().record(MODEL_NAME, 0, success=False, prompt_tokens=prompt_tokens)
         pool.mark_error(acq.acct, str(e))
         acq.release()
         raise
@@ -579,6 +833,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
     async def event_stream():
         nonlocal t0
+        completion_parts: list[str] = []
         try:
             yield _openai_chunk(proxy_id, finish=False)
             role_sent = False
@@ -592,7 +847,8 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             for token in acq.adapter.chat_stream(ds_id, prompt,
                                                   model_type=model_type,
                                                   thinking_enabled=thinking_mode,
-                                                  search_enabled=search_enabled):
+                                                  search_enabled=search_enabled,
+                                                  parent_message_id=acq.parent_message_id):
                 if isinstance(token, dict):
                     tt = token.get("__type")
                     if tt == "status":
@@ -602,6 +858,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                     elif tt == "thinking":
                         content = token.get("content", "")
                         if content:
+                            completion_parts.append(content)
                             if not role_sent:
                                 yield _openai_chunk(proxy_id, reasoning_content="", role="assistant")
                                 role_sent = True
@@ -613,6 +870,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                 for evt in sieve.feed(token):
                     if evt.type == "text":
                         if evt.data:
+                            completion_parts.append(evt.data)
                             if not role_sent:
                                 if thinking_mode:
                                     yield _openai_chunk(proxy_id, reasoning_content="")
@@ -630,6 +888,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
             had_tool = False
             for evt in sieve.flush():
                 if evt.type == "text" and evt.data:
+                    completion_parts.append(evt.data)
                     if not role_sent:
                         if thinking_mode:
                             yield _openai_chunk(proxy_id, reasoning_content="")
@@ -661,10 +920,34 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
             yield _openai_chunk(proxy_id, finish=True)
             yield "data: [DONE]\n\n"
+            completion_tokens = count_text("".join(completion_parts))
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
+                               prompt_tokens=prompt_tokens,
+                               completion_tokens=completion_tokens)
         except Exception as e:
-            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False,
+                               prompt_tokens=prompt_tokens)
             pool.mark_error(acq.acct, str(e))
-            raise
+            log.exception("openai_stream_failed")
+            # Emit a uniform error frame to the client, then [DONE] so the
+            # client SDK doesn't see a truncated stream.
+            err = {
+                "id": proxy_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": MODEL_NAME,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "error",
+                }],
+                "error": {
+                    "type": "upstream_error",
+                    "message": str(e)[:500],
+                },
+            }
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
         finally:
             acq.release()
 
@@ -674,6 +957,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            **(rate_headers or {}),
         },
     )
 
@@ -729,4 +1013,5 @@ if _os.path.isdir(_WEBUI_DIR):
         return {"error": "webui not built"}
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False)
+    _validate_startup()
+    uvicorn.run("server:app", host=HOST, port=PORT, reload=False)

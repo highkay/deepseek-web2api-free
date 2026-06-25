@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.environ.setdefault("DEEPSEEK_ADMIN_PASSWORD", "ci-smoke-test-pw")
 os.environ.setdefault("ACCOUNT_STORE_PATH", str(PROJECT_ROOT / "data" / "accounts.ci.json"))
 os.environ.setdefault("ALLOW_UNAUTHENTICATED_API", "false")
+os.environ.setdefault("HOST", "127.0.0.1")
 os.environ.setdefault("PORT", "18080")
 
 # Run from the project root so adapter.py's `open("sha3_wasm_bg.wasm")`

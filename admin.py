@@ -5,14 +5,22 @@ import os
 import secrets
 import threading
 import time
+from collections import deque
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from account_pool import AccountPool
+from ip_utils import get_real_client_ip, is_trusted_proxy
+from logger import get_logger
+
+log = get_logger("admin")
 
 # ── Admin password (set DEEPSEEK_ADMIN_PASSWORD in .env) ──────
 _ADMIN_PASSWORD = os.environ.get("DEEPSEEK_ADMIN_PASSWORD", "admin")
+# Insecure defaults that we explicitly forbid on a public bind unless
+# the operator sets ALLOW_INSECURE_PUBLIC_DEFAULTS=true.
+_INSECURE_PASSWORDS = {"", "admin", "password", "123456", "changeme"}
 
 # ── Token management ──────────────────────────────────────────
 _tokens: set[str] = set()
@@ -20,6 +28,15 @@ _tokens: set[str] = set()
 
 def _generate_token() -> str:
     return secrets.token_hex(32)
+
+
+def is_admin_password_weak() -> bool:
+    """True if the configured admin password is the default or otherwise weak.
+
+    The caller decides what to do with this signal (warn loudly, refuse to
+    start on a public bind, etc.). We never refuse on a loopback bind.
+    """
+    return (_ADMIN_PASSWORD or "") in _INSECURE_PASSWORDS
 
 
 def _verify_token(token: str) -> bool:
@@ -44,15 +61,11 @@ _login_lock = threading.Lock()
 
 
 def _client_ip(request: Request) -> str:
-    # Prefer X-Forwarded-For when behind a trusted proxy. The deployment guide
-    # warns against exposing /admin/api/login publicly without TLS, so this is
-    # best-effort identification, not a security boundary.
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+    """Resolve the *real* client IP. Trusts X-Forwarded-For only when the
+    immediate connection peer is in the TRUSTED_PROXIES allowlist.
+    """
+    peer = request.client.host if request.client else None
+    return get_real_client_ip(request.headers, peer)
 
 
 def _login_record_failure(ip: str) -> None:
@@ -85,6 +98,18 @@ def _login_clear(ip: str) -> None:
 
 
 # ── Stats ─────────────────────────────────────────────────────
+_LATENCY_WINDOW_SIZE = 1024
+
+
+def _percentile(values: list[float], pct: float) -> int:
+    """Return the pct-th percentile of a sorted list of numbers (0..100)."""
+    if not values:
+        return 0
+    sorted_v = sorted(values)
+    k = max(0, min(len(sorted_v) - 1, int(round((pct / 100.0) * (len(sorted_v) - 1)))))
+    return int(sorted_v[k])
+
+
 class StatsSnapshot:
     def __init__(self):
         self.reset()
@@ -98,6 +123,10 @@ class StatsSnapshot:
         self.total_completion_tokens = 0
         self.start_time = time.time()
         self.models: dict[str, dict] = {}
+        # Bounded ring buffer of recent latencies (ms) for percentile
+        # computation. ``deque(maxlen=N)`` is O(1) on push and silently
+        # drops the oldest entry when full.
+        self._recent_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW_SIZE)
 
     def record(self, model: str, latency_ms: float,
                prompt_tokens: int = 0, completion_tokens: int = 0,
@@ -105,16 +134,29 @@ class StatsSnapshot:
         self.total_requests += 1
         if success:
             self.success_requests += 1
+            if latency_ms > 0:
+                self._recent_latencies.append(float(latency_ms))
         else:
             self.failed_requests += 1
         self.total_latency_ms += latency_ms
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
         if model not in self.models:
-            self.models[model] = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0}
+            self.models[model] = {"requests": 0, "prompt_tokens": 0,
+                                  "completion_tokens": 0, "errors": 0}
         self.models[model]["requests"] += 1
         self.models[model]["prompt_tokens"] += prompt_tokens
         self.models[model]["completion_tokens"] += completion_tokens
+        if not success:
+            self.models[model]["errors"] += 1
+
+    def percentile(self, pct: float) -> int:
+        return _percentile(list(self._recent_latencies), pct)
+
+    def success_rate(self) -> float:
+        if self.total_requests == 0:
+            return 0.0
+        return self.success_requests / self.total_requests
 
 
 _stats = StatsSnapshot()
@@ -192,8 +234,10 @@ async def login(req: LoginRequest, request: Request):
         _login_clear(ip)
         token = _generate_token()
         _tokens.add(token)
+        log.info("admin_login_success", extra={"ip": ip})
         return {"token": token}
     _login_record_failure(ip)
+    log.warning("admin_login_failed", extra={"ip": ip})
     _login_check_over_limit(ip)
     raise HTTPException(status_code=403, detail="Invalid password")
 
@@ -217,7 +261,12 @@ async def stats(request: Request):
         "total_requests": s.total_requests,
         "success_requests": s.success_requests,
         "failed_requests": s.failed_requests,
+        "success_rate": round(s.success_rate(), 4),
         "avg_latency_ms": avg_latency,
+        "p50_latency_ms": s.percentile(50),
+        "p95_latency_ms": s.percentile(95),
+        "p99_latency_ms": s.percentile(99),
+        "latency_window_size": len(s._recent_latencies),
         "total_prompt_tokens": s.total_prompt_tokens,
         "total_completion_tokens": s.total_completion_tokens,
         "uptime_secs": uptime,

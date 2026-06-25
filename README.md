@@ -8,6 +8,35 @@
 
 ---
 
+## v2.2.0 新增
+
+v2.2.0 在保持向后兼容的同时引入了大量安全和功能改进：
+
+- **安全加固**
+  - 默认 `HOST=127.0.0.1`（不再默认 `0.0.0.0`）；公网绑定 + 默认密码时拒绝启动
+  - 结构化 JSON 日志 (`LOG_FORMAT=json`)，可切换为 `text`
+  - `data/accounts.json` 可选 Fernet (AES-128-CBC + HMAC) 加密 (`DEEPSEEK_ENCRYPTION_KEY`)
+  - CORS 严格化 (默认同源，需 `ALLOWED_ORIGINS` 显式允许)
+  - XFF 仅在 `TRUSTED_PROXIES` 白名单内的代理下游才被信任
+  - 全部响应注入 `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` 安全头
+  - WebUI 额外注入 `Content-Security-Policy` 头
+- **Bug 修复**
+  - Anthropic 非流式端点不再丢弃 `thinking` 内容
+  - 账号错误状态自动后台恢复（每 3 次失败一次）
+  - `usage` 字段返回真实 token 数（基于 tiktoken cl100k_base；无 tiktoken 时回退到字符启发式）
+  - StreamSieve 边界：迭代式排空、`<` 边界、1 MB 缓冲上限（可配置）
+- **新功能**
+  - **模型路由** (`MODEL_ROUTES`) — 按 `model` 字段切换 quick/expert
+  - **多轮会话** (`SESSION_CACHE_TTL`) — 同一 user/会话复用 chat_session_id
+  - **客户端限流** (`CLIENT_RPM_PER_KEY` / `CLIENT_RPM_PER_IP`) — 双维度滑动窗口
+  - **P50/P95/P99 延迟** + **成功率** 在 `/admin/api/stats` 暴露
+- **工程化**
+  - 56 个 pytest 单元测试，CI 矩阵 (Python 3.10 / 3.11 / 3.12)
+  - 所有 silent pass (`except Exception: pass`) 替换为 `logger.exception(...)`
+  - `print(WARNING...)` 全部替换为结构化 logger
+
+---
+
 ## 功能特性
 
 - **OpenAI 兼容** — `/v1/chat/completions` 与 `/v1/models` 接口，支持 `stream` 模式
@@ -20,8 +49,10 @@
 - **Function Calling** — 基于 DSML（DeepSeek Markup Language）提示词注入实现工具调用
 - **流式筛分** — `StreamSieve` 引擎，逐字符检测 DSML 工具调用标签，从 SSE 流中实时分离正文与工具调用
 - **PoW 鉴权** — 自动完成 WASM 工作量证明（DeepSeekHashV1）挑战
-- **会话管理** — 自动创建和管理 DeepSeek Chat 会话
-- **环境变量控制** — `MODE`/`THINKING`/`SEARCH` 环境变量独立控制模式/思考/搜索，`PORT` 配置监听端口
+- **会话管理** — 自动创建和管理 DeepSeek Chat 会话；可选多轮会话复用
+- **多账号池** — 轮询分配、idle/busy/error 状态、健康检查、自动恢复
+- **客户端限流** — 滑动窗口，按 API key 和 IP 独立计数；响应头 `X-RateLimit-*`
+- **使用量统计** — 基于 tiktoken 估算的 prompt / completion / total tokens
 - **管理面板** — 内置 Web 管理界面，支持请求统计、账号池管理（多账号轮询/持久化增删改查/重登录）
 
 ---
@@ -442,6 +473,104 @@ DSML 使用类似 XML 的标签结构。当模型决定调用工具时，响应�
 
 ---
 
+## 多轮会话（v2.2.0）
+
+DeepSeek Chat 协议本身支持 `parent_message_id` 串接同 `chat_session_id` 内的消息。v2.2.0 利用此能力为兼容端点提供轻量级多轮支持：
+
+- **Anthropic 客户端**：通过请求体中的 `metadata.user_id` 字段作为会话粘性 key
+- **OpenAI 客户端**：通过自定义 HTTP 头 `X-Conversation-Id` 作为会话 key
+- **Fallback**：当两者都未设置时，对第一条 user 消息做 SHA-256 摘要作为 key
+
+会话缓存默认 TTL 为 600 秒（`SESSION_CACHE_TTL`），过期后自动开始新会话。设置 `SESSION_CACHE_TTL=0` 完全禁用多轮行为。
+
+```bash
+# OpenAI 多轮示例（带 X-Conversation-Id 头）
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "X-Conversation-Id: user-42-session-7" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[
+    {"role":"user","content":"我叫小明"},
+    {"role":"user","content":"我叫什么？"}
+  ]}'
+# 第二条消息会看到第一条的上下文。
+```
+
+> **注意**：多轮会话依赖 DeepSeek 上游接受 `parent_message_id`；如果上游对历史消息有长度限制，长会话可能中途被截断。当前的 `_msg_counters` 在 adapter 内是会话级单调递增的，所以即使缓存未命中也不会破坏既有行为。
+
+---
+
+## 模型路由（v2.2.0）
+
+通过 `MODEL_ROUTES` 环境变量，客户端可以发送不同的 `model` 字段让代理自动选择 `model_type`（quick/expert）和默认的 thinking/search 设置：
+
+```bash
+# 简单形式 — 字符串值
+MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
+
+# 完整形式 — dict 值
+MODEL_ROUTES={"deepseek-reasoner":{"model_type":"expert","thinking":"enabled","search":"disabled"}}
+```
+
+未命中的 model 名按既有 `MODE` / `THINKING` / `SEARCH` env 变量处理。`/v1/models` 端点会返回 `MODEL_ROUTES` 中声明的所有 model 名。
+
+---
+
+## 客户端限流（v2.2.0）
+
+v2.2.0 内置了基于滑动窗口的双维度限流器：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `ENABLE_RATE_LIMIT` | `true` | 总开关；设为 `false` 完全禁用 |
+| `CLIENT_RPM_PER_KEY` | `60` | 每 API key 每分钟请求数（0 = 不限） |
+| `CLIENT_RPM_PER_IP` | `120` | 每 IP 每分钟请求数（0 = 不限） |
+
+每个请求需要 **同时** 通过 key 和 IP 两个维度的检查。命中限流时返回 `429 Too Many Requests`，响应头含：
+
+```
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 47
+Retry-After: 47
+```
+
+> 限流状态保存在进程内；多 worker 部署（gunicorn -w N）实际限制为 N × 配置值。
+
+---
+
+## 使用量统计（v2.2.0）
+
+`usage` 字段从 v2.1 的硬编码 `-1` 升级为真实 token 数。优先使用 `tiktoken` 的 `cl100k_base` 编码（与 DeepSeek 兼容），未安装时回退到字符启发式（CJK 1 token/字，ASCII 约 1 token/4 字符）。
+
+服务端面板的 `/admin/api/stats` 现在还返回：
+
+| 字段 | 说明 |
+|------|------|
+| `success_rate` | 0.0..1.0 |
+| `p50_latency_ms` / `p95_latency_ms` / `p99_latency_ms` | 最近 1024 次请求的延迟百分位 |
+| `latency_window_size` | 当前环形缓冲已用大小 |
+| `total_prompt_tokens` / `total_completion_tokens` | 整个进程生命周期的累计 tokens |
+
+---
+
+## 安全建议（生产部署 checklist）
+
+部署到公网前请按顺序检查：
+
+1. **修改默认 admin 密码**：`.env` 中 `DEEPSEEK_ADMIN_PASSWORD=…`（16+ 字符随机）。默认密码 + 公网绑定时服务**会拒绝启动**。
+2. **设置 Fernet 加密 key**：`DEEPSEEK_ENCRYPTION_KEY=…`，生成方式 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。已有明文 `data/accounts.json` 会在首次启动时自动迁移，原始文件保留为 `accounts.json.v1.bak`。
+3. **设置 API key**：`.env` 中 `API_KEYS=sk-real-key-1,sk-real-key-2`（多个用逗号分隔）。`ALLOW_UNAUTHENTICATED_API` 保持 `false`。
+4. **配置 CORS 白名单**：`ALLOWED_ORIGINS=https://app.example.com`，而不是依赖默认同源策略。
+5. **如果用反向代理**（nginx、Caddy、Traefik）：设置 `TRUSTED_PROXIES=10.0.0.0/8`（你的代理网段）让 admin 限流能正确识别客户端 IP。
+6. **绑定地址**：默认 `127.0.0.1`。如果要走反向代理，保持 loopback；如果直连公网，设置 `HOST=0.0.0.0` 并确保前置有 TLS + WAF。
+7. **使用 HTTPS**：限流响应头里包含 token 计数和 IP；admin 端点需要 HTTPS 保护。强烈建议配合 Cloudflare / Caddy 等前端使用。
+8. **定期轮换**：token / cookie 90 天左右主动续期；`accounts.json` 是敏感文件，确保所在分区权限 `0o700` / NTFS ACL 限制。
+9. **限流**：保留默认 `CLIENT_RPM_PER_KEY=60`、`CLIENT_RPM_PER_IP=120`，按你的实际流量调整。
+10. **监控**：`GET /health` 适合做存活探针；`/admin/api/stats` 适合做业务指标抓取。
+
+---
+
 ## 架构概览
 
 ```
@@ -634,23 +763,79 @@ DeepSeek 的 Token 有效期不明确。如果遇到 `401` 或 `403` 响应，�
 
 ## 环境变量参考
 
+### 核心配置
+
 | 变量 | 默认值 | 必填 | 说明 |
 |------|--------|------|------|
+| `HOST` | `127.0.0.1` | 否 | 监听地址。`0.0.0.0` 配合默认 admin 密码时拒绝启动 |
+| `PORT` | `8080` | 否 | 服务器监听端口 |
 | `API_KEYS` | `""` | 公网部署必填 | 客户端访问 `/v1/*` 的 API Key，支持逗号分隔多个 key |
-| `DEEPSEEK_API_KEY` | `""` | 否 | 单个客户端 API Key 别名，也可用于 `/v1/*` 鉴权 |
+| `DEEPSEEK_API_KEY` | `""` | 否 | 单个客户端 API Key 别名 |
 | `ALLOW_UNAUTHENTICATED_API` | `false` | 否 | 是否允许 `/v1/*` 无鉴权访问；公网部署不要开启 |
+| `ALLOW_INSECURE_PUBLIC_DEFAULTS` | `false` | 否 | 显式确认在公网上使用默认密码（不建议） |
+
+### DeepSeek 账号
+
+| 变量 | 默认值 | 必填 | 说明 |
+|------|--------|------|------|
 | `DEEPSEEK_TOKEN` | `""` | 有 DeepSeek 账号时必填 | DeepSeek API 的 Bearer Token（单账号兼容格式） |
 | `DEEPSEEK_COOKIES` | `""` | 有 DeepSeek 账号时必填 | DeepSeek 的 Cookie 值（单账号兼容格式） |
 | `DEEPSEEK_TOKEN_N` | `""` | 否 | 第 N 个 DeepSeek 账号 Token，例如 `DEEPSEEK_TOKEN_1` |
-| `DEEPSEEK_COOKIES_N` | `""` | 否 | 第 N 个 DeepSeek 账号 Cookies，例如 `DEEPSEEK_COOKIES_1` |
+| `DEEPSEEK_COOKIES_N` | `""` | 否 | 第 N 个 DeepSeek 账号 Cookies |
 | `DEEPSEEK_EMAIL_N` | `"env-N"` | 否 | 第 N 个账号的备注/标识 |
-| `ACCOUNT_STORE_PATH` | `data/accounts.json` | 否 | 面板持久化账号保存路径，包含敏感凭证 |
-| `MODEL_NAME` | `"deepseek-chat"` | 否 | API 响应中显示的模型名称 |
-| `PORT` | `8080` | 否 | 服务器监听端口 |
-| `MODE` | `"auto"` | 否 | `auto` / `quick` / `expert` |
-| `THINKING` | `"auto"` | 否 | `auto` / `enabled` / `disabled` |
-| `SEARCH` | `"auto"` | 否 | `auto` / `enabled` / `disabled` |
-| `DEEPSEEK_ADMIN_PASSWORD` | `"admin"` | 否 | 管理面板登录密码 |
+| `ACCOUNT_STORE_PATH` | `data/accounts.json` | 否 | 面板持久化账号保存路径 |
+
+### 模型行为
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MODEL_NAME` | `"deepseek-chat"` | `/v1/models` 默认显示的模型名（`MODEL_ROUTES` 存在时显示路由表） |
+| `MODE` | `"auto"` | `auto` / `quick` / `expert` |
+| `THINKING` | `"auto"` | `auto` / `enabled` / `disabled` |
+| `SEARCH` | `"auto"` | `auto` / `enabled` / `disabled` |
+| `MODEL_ROUTES` | `""` | JSON 路由表，按 `model` 字段切换 `model_type`/thinking/search |
+
+### 管理面板
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DEEPSEEK_ADMIN_PASSWORD` | `"admin"` | 管理面板登录密码（公网部署必须修改） |
+
+### 限流 & 会话
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ENABLE_RATE_LIMIT` | `true` | 客户端限流总开关 |
+| `CLIENT_RPM_PER_KEY` | `60` | 每 API key 每分钟请求数 |
+| `CLIENT_RPM_PER_IP` | `120` | 每 IP 每分钟请求数 |
+| `SESSION_CACHE_TTL` | `600` | 多轮会话缓存 TTL（秒），0 = 禁用多轮 |
+
+### 安全 & 加密
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ALLOWED_ORIGINS` | `""` | CORS 允许的 origin 列表（逗号分隔），空 = 同源 |
+| `ALLOW_CORS_CREDENTIALS` | `false` | 是否允许带 credentials 的跨域（需配合 `ALLOWED_ORIGINS`） |
+| `TRUSTED_PROXIES` | `""` | 信任的代理 IP/CIDR（设置后 `X-Forwarded-For` 才会被采纳） |
+| `DEEPSEEK_ENCRYPTION_KEY` | `""` | Fernet key；设置后 `data/accounts.json` 中的 token/cookies 自动加密 |
+
+### 日志 & 反检测
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `LOG_LEVEL` | `INFO` | DEBUG/INFO/WARNING/ERROR |
+| `LOG_FORMAT` | `json` | `json`（生产）或 `text`（开发） |
+| `DEEPSEEK_IMPERSONATE` | `chrome131` | curl_cffi TLS 指纹 profile |
+| `DEEPSEEK_JITTER_SECS` | `0.0` | 调用间随机抖动（秒） |
+| `DSML_MAX_BUFFER_BYTES` | `1048576` | StreamSieve 捕获缓冲上限 |
+| `DISABLE_AUTO_RECOVER` | `false` | 设为 true 禁用账号自动恢复 |
+
+### 反检测 — 每个账号的代理
+
+| 变量 | 说明 |
+|------|------|
+| `DEEPSEEK_PROXY` / `DEEPSEEK_PROXY_N` | 单个 / 第 N 个账号的上游代理 URL |
+| `DEEPSEEK_EMAIL` | 旧版单账号格式的邮箱备注 |
 
 ---
 
