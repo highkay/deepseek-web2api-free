@@ -978,7 +978,15 @@ _WEBUI_DIST = _os.path.realpath(
 _WEBUI_LEGACY = _os.path.realpath(
     _os.path.join(_os.path.dirname(__file__), "webui")
 )
-_WEBUI_DIR = _WEBUI_DIST if _os.path.isdir(_WEBUI_DIST) else _WEBUI_LEGACY
+# Always register the /webui routes even if the build hasn't run yet —
+# the handlers will return a friendly JSON error pointing the operator
+# at `npm run build`. This keeps the routes in the OpenAPI schema so
+# the smoke test (and downstream tooling) can find them.
+_WEBUI_DIR = (
+    _WEBUI_DIST if _os.path.isdir(_WEBUI_DIST)
+    else _WEBUI_LEGACY if _os.path.isdir(_WEBUI_LEGACY)
+    else _WEBUI_DIST  # fall through to the canonical v3 path
+)
 
 app.include_router(admin_router)
 
@@ -1013,7 +1021,7 @@ def _webui_index_path() -> str | None:
     return index if _os.path.isfile(index) else None
 
 
-if _os.path.isdir(_WEBUI_DIR):
+if _os.path.isdir(_WEBUI_DIR) or True:  # always register so /webui is in the OpenAPI schema
     @app.get("/webui/{rest_of_path:path}")
     async def webui_spa(rest_of_path: str):
         safe = _safe_webui_path(rest_of_path)
