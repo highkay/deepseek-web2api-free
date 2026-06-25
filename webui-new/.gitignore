@@ -1,0 +1,25 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*

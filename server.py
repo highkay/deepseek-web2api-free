@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from adapter import DeepSeekAdapter
 from admin import router as admin_router, get_pool, get_stats, is_admin_password_weak
+from stats_history import start_sampler
 from tool_dsml import (
     parse_dsml_tool_calls,
     format_tool_calls_for_prompt,
@@ -176,6 +177,9 @@ async def _add_security_headers(request: Request, call_next):
 
 
 pool = get_pool()
+
+# Start the rolling history sampler (v3 webui dashboard charts).
+start_sampler(get_stats())
 
 if pool.count() == 0:
     log.warning(
@@ -964,7 +968,17 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
 # ── Admin & static file serving ──────────────────────────────
 
-_WEBUI_DIR = _os.path.realpath(_os.path.join(_os.path.dirname(__file__), "webui"))
+# v3 webui lives under webui-new/dist/ (built by `npm run build` /
+# `scripts/build_webui.sh`). The old v2.2.0 webui/ directory is removed
+# in v3.0.0; for development convenience we still fall back to it if
+# the new dist/ hasn't been built yet.
+_WEBUI_DIST = _os.path.realpath(
+    _os.path.join(_os.path.dirname(__file__), "webui-new", "dist")
+)
+_WEBUI_LEGACY = _os.path.realpath(
+    _os.path.join(_os.path.dirname(__file__), "webui")
+)
+_WEBUI_DIR = _WEBUI_DIST if _os.path.isdir(_WEBUI_DIST) else _WEBUI_LEGACY
 
 app.include_router(admin_router)
 
@@ -994,23 +1008,29 @@ def _safe_webui_path(rest_of_path: str) -> str | None:
     return candidate
 
 
+def _webui_index_path() -> str | None:
+    index = _os.path.join(_WEBUI_DIR, "index.html")
+    return index if _os.path.isfile(index) else None
+
+
 if _os.path.isdir(_WEBUI_DIR):
     @app.get("/webui/{rest_of_path:path}")
     async def webui_spa(rest_of_path: str):
         safe = _safe_webui_path(rest_of_path)
         if safe is not None:
             return FileResponse(safe)
-        index = _os.path.join(_WEBUI_DIR, "index.html")
-        if _os.path.isfile(index):
+        # SPA fallback: serve index.html so react-router-dom can take over.
+        index = _webui_index_path()
+        if index is not None:
             return FileResponse(index)
-        return {"error": "webui not built"}
+        return {"error": "webui not built — run `npm run build` in webui-new/"}
 
     @app.get("/webui")
     async def webui_root():
-        index = _os.path.join(_WEBUI_DIR, "index.html")
-        if _os.path.isfile(index):
+        index = _webui_index_path()
+        if index is not None:
             return FileResponse(index)
-        return {"error": "webui not built"}
+        return {"error": "webui not built — run `npm run build` in webui-new/"}
 
 if __name__ == "__main__":
     _validate_startup()

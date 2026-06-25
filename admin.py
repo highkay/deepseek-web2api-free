@@ -11,8 +11,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from account_pool import AccountPool
+from crypto import is_enabled as crypto_is_enabled, _resolve_key
 from ip_utils import get_real_client_ip, is_trusted_proxy
 from logger import get_logger
+from stats_history import get_history, start_sampler
 
 log = get_logger("admin")
 
@@ -271,6 +273,99 @@ async def stats(request: Request):
         "total_completion_tokens": s.total_completion_tokens,
         "uptime_secs": uptime,
         "models": s.models,
+    }
+
+
+@router.get("/history")
+async def history(request: Request):
+    """Return the rolling time-series of StatsSnapshot, for the dashboard charts."""
+    _check_auth(request)
+    h = get_history()
+    return {
+        "interval_secs": h.interval(),
+        "points": h.points(),
+    }
+
+
+@router.get("/env")
+async def env_info(request: Request):
+    """Return a read-only view of the effective runtime configuration.
+
+    Powers the React "Settings" page. Intentionally hides secret values
+    (only "set / default" indicators for credentials) so a logged-in
+    admin cannot exfiltrate the DeepSeek token via this endpoint.
+    """
+    _check_auth(request)
+    pool = _pool
+
+    # Enumerate the env vars we know about. ``is_default`` is True when
+    # the value matches the module-level default; "set" otherwise.
+    def _env(name: str) -> str:
+        return os.environ.get(name, "")
+
+    def _flag(name: str) -> str:
+        return "set" if os.environ.get(name) else "default"
+
+    admin_pwd = os.environ.get("DEEPSEEK_ADMIN_PASSWORD", "admin")
+    crypto_on = crypto_is_enabled()
+    origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    trusted = [p.strip() for p in os.environ.get("TRUSTED_PROXIES", "").split(",") if p.strip()]
+
+    return {
+        "host": os.environ.get("HOST", "127.0.0.1"),
+        "port": int(os.environ.get("PORT", "8080")),
+        "insecure_public_defaults": os.environ.get("ALLOW_INSECURE_PUBLIC_DEFAULTS", "false").lower() in {"1", "true", "yes", "on"},
+        "admin_password_set": bool(admin_pwd),
+        "admin_password_weak": admin_pwd in {"", "admin", "password", "123456", "changeme"},
+        "accounts_total": pool.count(),
+        "accounts_source_env": sum(1 for a in pool.get_all() if a.get("source") == "env"),
+        "accounts_source_file": sum(1 for a in pool.get_all() if a.get("source") == "file"),
+        "crypto": {
+            "enabled": crypto_on,
+            "fernet_configured": bool(_resolve_key()),
+        },
+        "cors": {
+            "origins": origins,
+            "allow_credentials": os.environ.get("ALLOW_CORS_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"},
+        },
+        "trusted_proxies": trusted,
+        "model_routes_configured": bool(os.environ.get("MODEL_ROUTES", "").strip()),
+        "rate_limit": {
+            "enabled": os.environ.get("ENABLE_RATE_LIMIT", "true").lower() in {"1", "true", "yes", "on"},
+            "per_key": int(os.environ.get("CLIENT_RPM_PER_KEY", "60") or 60),
+            "per_ip": int(os.environ.get("CLIENT_RPM_PER_IP", "120") or 120),
+        },
+        "session_cache_ttl": int(os.environ.get("SESSION_CACHE_TTL", "600") or 600),
+        "log_level": os.environ.get("LOG_LEVEL", "INFO").upper(),
+        "log_format": os.environ.get("LOG_FORMAT", "json").lower(),
+        "dsml_max_buffer_bytes": int(os.environ.get("DSML_MAX_BUFFER_BYTES", "1048576") or 1048576),
+        "uptime_secs": int(time.time() - _stats.start_time),
+        "server_version": "3.0.0",
+        "env_overrides": [
+            {"name": "HOST", "value": _env("HOST") or "127.0.0.1", "is_default": _flag("HOST") == "default"},
+            {"name": "PORT", "value": _env("PORT") or "8080", "is_default": _flag("PORT") == "default"},
+            {"name": "ALLOW_UNAUTHENTICATED_API", "value": _env("ALLOW_UNAUTHENTICATED_API") or "false", "is_default": _flag("ALLOW_UNAUTHENTICATED_API") == "default"},
+            {"name": "ALLOW_INSECURE_PUBLIC_DEFAULTS", "value": _env("ALLOW_INSECURE_PUBLIC_DEFAULTS") or "false", "is_default": _flag("ALLOW_INSECURE_PUBLIC_DEFAULTS") == "default"},
+            {"name": "MODE", "value": _env("MODE") or "auto", "is_default": _flag("MODE") == "default"},
+            {"name": "THINKING", "value": _env("THINKING") or "auto", "is_default": _flag("THINKING") == "default"},
+            {"name": "SEARCH", "value": _env("SEARCH") or "auto", "is_default": _flag("SEARCH") == "default"},
+            {"name": "MODEL_NAME", "value": _env("MODEL_NAME") or "deepseek-chat", "is_default": _flag("MODEL_NAME") == "default"},
+            {"name": "MODEL_ROUTES", "value": _env("MODEL_ROUTES") or "", "is_default": _flag("MODEL_ROUTES") == "default"},
+            {"name": "DEEPSEEK_ADMIN_PASSWORD", "value": "***" if admin_pwd else "", "is_default": _flag("DEEPSEEK_ADMIN_PASSWORD") == "default"},
+            {"name": "DEEPSEEK_ENCRYPTION_KEY", "value": "***" if crypto_on else "", "is_default": _flag("DEEPSEEK_ENCRYPTION_KEY") == "default"},
+            {"name": "ALLOWED_ORIGINS", "value": _env("ALLOWED_ORIGINS") or "", "is_default": _flag("ALLOWED_ORIGINS") == "default"},
+            {"name": "TRUSTED_PROXIES", "value": _env("TRUSTED_PROXIES") or "", "is_default": _flag("TRUSTED_PROXIES") == "default"},
+            {"name": "ENABLE_RATE_LIMIT", "value": _env("ENABLE_RATE_LIMIT") or "true", "is_default": _flag("ENABLE_RATE_LIMIT") == "default"},
+            {"name": "CLIENT_RPM_PER_KEY", "value": _env("CLIENT_RPM_PER_KEY") or "60", "is_default": _flag("CLIENT_RPM_PER_KEY") == "default"},
+            {"name": "CLIENT_RPM_PER_IP", "value": _env("CLIENT_RPM_PER_IP") or "120", "is_default": _flag("CLIENT_RPM_PER_IP") == "default"},
+            {"name": "SESSION_CACHE_TTL", "value": _env("SESSION_CACHE_TTL") or "600", "is_default": _flag("SESSION_CACHE_TTL") == "default"},
+            {"name": "LOG_LEVEL", "value": _env("LOG_LEVEL") or "INFO", "is_default": _flag("LOG_LEVEL") == "default"},
+            {"name": "LOG_FORMAT", "value": _env("LOG_FORMAT") or "json", "is_default": _flag("LOG_FORMAT") == "default"},
+            {"name": "DSML_MAX_BUFFER_BYTES", "value": _env("DSML_MAX_BUFFER_BYTES") or "1048576", "is_default": _flag("DSML_MAX_BUFFER_BYTES") == "default"},
+            {"name": "STATS_HISTORY_INTERVAL_SECS", "value": _env("STATS_HISTORY_INTERVAL_SECS") or "30", "is_default": _flag("STATS_HISTORY_INTERVAL_SECS") == "default"},
+            {"name": "DEEPSEEK_IMPERSONATE", "value": _env("DEEPSEEK_IMPERSONATE") or "chrome131", "is_default": _flag("DEEPSEEK_IMPERSONATE") == "default"},
+            {"name": "DEEPSEEK_JITTER_SECS", "value": _env("DEEPSEEK_JITTER_SECS") or "0.0", "is_default": _flag("DEEPSEEK_JITTER_SECS") == "default"},
+        ],
     }
 
 

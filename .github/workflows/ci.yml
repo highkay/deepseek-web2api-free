@@ -30,10 +30,6 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Run smoke test
-        # The smoke test boots the whole app graph (imports server.py →
-        # adapter.py, which reads sha3_wasm_bg.wasm at import time). It
-        # exercises /health, /webui, the admin auth flow, and verifies
-        # that the webui path-traversal fix holds.
         run: |
           python -m tests.smoke
 
@@ -96,9 +92,54 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Run end-to-end checks
-        # Each scenario runs in its own sub-process because the server
-        # module caches env-var values at import time, and importlib.reload
-        # does not refresh `from admin import is_admin_password_weak`
-        # bindings — so we re-launch a fresh interpreter per scenario.
         run: |
           python scripts/run_e2e.py
+
+  webui:
+    name: WebUI build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [smoke, unit]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webui-new/package-lock.json
+
+      - name: Install dependencies
+        working-directory: webui-new
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Build
+        working-directory: webui-new
+        run: npm run build
+
+      - name: Verify build output
+        working-directory: webui-new
+        run: |
+          test -f dist/index.html || (echo "ERROR: dist/index.html missing" && exit 1)
+          test -d dist/assets || (echo "ERROR: dist/assets missing" && exit 1)
+          echo "WebUI build OK:"
+          ls -la dist/
+          echo
+          echo "Asset sizes:"
+          du -sh dist/assets/*
+
+      - name: Upload webui build as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui-new/dist/
+          if-no-files-found: error
+          retention-days: 7
