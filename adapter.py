@@ -318,6 +318,27 @@ class DeepSeekAdapter:
                 current_event = ""
         return events
 
+    @staticmethod
+    def _scan_toast_errors(events):
+        """Return the first upstream toast error in ``events`` as
+        ``(message, finish_reason)``, or ``None`` if there is none.
+
+        DeepSeek's web backend signals "this client is too old to use
+        Expert / your account hit a content policy / etc." via an SSE
+        ``toast`` event with ``type=error`` instead of a non-2xx HTTP
+        status. Without this scan we silently turn that into an empty
+        completion (issue #8) and the user has no idea why.
+        """
+        for event_type, data in events:
+            if event_type != "toast" or not isinstance(data, dict):
+                continue
+            if str(data.get("type", "")).lower() != "error":
+                continue
+            content = data.get("content") or data.get("msg") or ""
+            finish_reason = data.get("finish_reason") or "upstream_toast_error"
+            return content, finish_reason
+        return None
+
     def _send_completion(self, session_id: str, prompt: str, stream: bool = False,
                          model_type: str | None = None,
                          thinking_enabled: bool = False, search_enabled: bool = False,
@@ -378,6 +399,13 @@ class DeepSeekAdapter:
                                       search_enabled=search_enabled,
                                       parent_message_id=parent_message_id)
         events = self._parse_sse(resp.text)
+
+        # Issue #8: upstream may reject with a `toast` event of type=error
+        # instead of a non-2xx HTTP status. Surface that to the caller as
+        # a real exception instead of silently returning empty content.
+        toast = self._scan_toast_errors(events)
+        if toast is not None:
+            raise RuntimeError(f"upstream_toast_error: {toast[0]} ({toast[1]})")
 
         # Collect all content from both normal mode and expert fragment mode
         content_parts = []
@@ -489,6 +517,7 @@ class DeepSeekAdapter:
                 raise WAFChallengeError(kind, resp.status_code, body_text)
             resp.raise_for_status()
             frag_type = None  # None, 'thinking', 'content'
+            current_event = ""  # tracks the most recent `event:` SSE field
 
             for line in resp.iter_lines():
                 # curl_cffi yields bytes from iter_lines.
@@ -497,8 +526,11 @@ class DeepSeekAdapter:
                         line = line.decode("utf-8")
                     except UnicodeDecodeError:
                         continue
-                line = line.strip()
+                line = line.rstrip()
                 if not line:
+                    continue
+                if line.startswith("event: "):
+                    current_event = line[7:]
                     continue
                 if not line.startswith("data: "):
                     continue
@@ -516,6 +548,27 @@ class DeepSeekAdapter:
                 p = data.get("p", "")
                 o = data.get("o", "")
                 v = data.get("v", "")
+
+                # Upstream may reject with a `toast` event of type=error
+                # (issue #8). Surface it as a real error so the SSE
+                # consumer sees the upstream message instead of empty
+                # content. The `event: toast` line and the `toast`
+                # payload both arrive as separate SSE frames, so we have
+                # to check both — sometimes the server only sends the
+                # data frame with the toast field inline.
+                if current_event == "toast" and isinstance(v, dict) and \
+                        str(v.get("type", "")).lower() == "error":
+                    raise RuntimeError(
+                        f"upstream_toast_error: {v.get('content') or v.get('msg') or ''} "
+                        f"({v.get('finish_reason') or 'upstream_toast_error'})"
+                    )
+                if isinstance(data.get("toast"), dict) and \
+                        str(data["toast"].get("type", "")).lower() == "error":
+                    t = data["toast"]
+                    raise RuntimeError(
+                        f"upstream_toast_error: {t.get('content') or t.get('msg') or ''} "
+                        f"({t.get('finish_reason') or 'upstream_toast_error'})"
+                    )
 
                 # Initial response with fragments (expert mode)
                 if isinstance(v, dict) and 'response' in v:
