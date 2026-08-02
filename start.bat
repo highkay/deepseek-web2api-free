@@ -26,7 +26,7 @@ if not defined PYTHON goto :no_python
 "%PYTHON%" --version >nul 2>&1 || goto :no_python
 "%PYTHON%" -c "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)" >nul 2>&1 || goto :old_python
 for /f "tokens=*" %%v in ('"%PYTHON%" --version 2^>^&1') do set "PYVER=%%v"
-echo [1/5] 系统 Python: !PYVER!
+echo [1/6] 系统 Python: !PYVER!
 echo.
 
 :: ============================================================
@@ -37,9 +37,9 @@ if exist ".venv\Scripts\python.exe" set "VENV=.venv"
 if not defined VENV if exist "venv\Scripts\python.exe" set "VENV=venv"
 if not defined VENV if exist "env\Scripts\python.exe" set "VENV=env"
 if defined VENV (
-    echo [2/5] 检测到虚拟环境: %VENV%
+    echo [2/6] 检测到虚拟环境: %VENV%
 ) else (
-    echo [2/5] 未找到虚拟环境，正在创建 .venv ...
+    echo [2/6] 未找到虚拟环境，正在创建 .venv ...
     "%PYTHON%" -m venv .venv
     if errorlevel 1 (
         echo        创建 .venv 失败，尝试 venv ...
@@ -59,7 +59,7 @@ echo.
 ::  3. 校验依赖（不足则自动安装）
 :: ============================================================
 set "CHK=%TEMP%\ds2api_pipchk_%RANDOM%.txt"
-echo [3/5] 正在校验 %VENV% 中的依赖 ...
+echo [3/6] 正在校验 %VENV% 中的依赖 ...
 "%PY%" -m pip install --dry-run -r "%REQ%" > "%CHK%" 2>&1
 set "DRY_RC=!errorlevel!"
 findstr /i "would install" "%CHK%" >nul 2>&1
@@ -78,9 +78,48 @@ if !DRY_RC! equ 0 if !NEED! equ 1 (
 echo.
 
 :: ============================================================
-::  4. 释放端口（只杀本项目的进程，绝不误杀他人）
+::  4. 构建 WebUI（v3.0.0 React 账号池管理面板）
 :: ============================================================
-echo [4/5] 检查端口 %PORT% ...
+set "WEBUI_DIR=webui-new"
+set "WEBUI_DIST=%WEBUI_DIR%\dist"
+set "NEED_BUILD=1"
+if exist "%WEBUI_DIST%\index.html" if not defined WEBUI_REBUILD set "NEED_BUILD=0"
+echo [4/6] 检查 WebUI 构建产物 ...
+if "!NEED_BUILD!"=="0" (
+    echo        WebUI 已构建，跳过构建（强制重建请先执行: set WEBUI_REBUILD=1）。
+) else (
+    if defined WEBUI_REBUILD (
+        echo        检测到 WEBUI_REBUILD，强制重新构建 ...
+    ) else (
+        echo        未找到构建产物，开始构建 ...
+    )
+    where node >nul 2>&1
+    if errorlevel 1 (
+        echo        [警告] 未找到 node/npm，无法构建 WebUI。
+        echo        仅启动后端 API；稍后可运行 %WEBUI_DIR%\scripts\build.bat 手动构建。
+    ) else (
+        pushd "%WEBUI_DIR%"
+        if not exist node_modules (
+            echo        安装 npm 依赖（首次构建可能需要几分钟）...
+            call npm install --no-audit --no-fund
+        )
+        echo        执行 npm run build ...
+        call npm run build
+        set "BUILD_RC=!errorlevel!"
+        popd
+        if !BUILD_RC! neq 0 (
+            echo        [警告] WebUI 构建失败，仅启动后端 API。
+            echo        可稍后运行 %WEBUI_DIR%\scripts\build.bat 重试。
+        ) else (
+            echo        WebUI 构建完成: %WEBUI_DIST%
+        )
+    )
+)
+echo.
+:: ============================================================
+::  5. 释放端口（只杀本项目的进程，绝不误杀他人）
+:: ============================================================
+echo [5/6] 检查端口 %PORT% ...
 set "BLOCKED="
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%PORT% " ^| findstr LISTENING') do (
     set "PID=%%a"
@@ -117,9 +156,9 @@ if defined BLOCKED (
 echo.
 
 :: ============================================================
-::  5. 启动服务
+::  6. 启动服务
 :: ============================================================
-echo [5/5] 正在启动服务 %HOST%:%PORT% ...
+echo [6/6] 正在启动服务 %HOST%:%PORT% ...
 echo.
 "%PY%" -m uvicorn server:app --host %HOST% --port %PORT%
 if errorlevel 1 (

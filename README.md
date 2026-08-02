@@ -152,6 +152,8 @@ python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}
 # 方式二：使用启动脚本 start.bat（推荐）
 #   - 自动检测 / 创建虚拟环境（.venv，其次 venv / env）
 #   - 自动校验依赖，不足则安装
+#   - 自动构建 WebUI（v3.0.0 React 账号池管理面板，dist 缺失时 npm 构建；
+#     已有产物则跳过，set WEBUI_REBUILD=1 可强制重建）
 #   - 只结束本项目的旧进程，绝不误杀占用端口的其他服务
 start.bat
 ```
