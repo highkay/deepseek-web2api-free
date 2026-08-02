@@ -8,6 +8,17 @@
 
 ---
 
+## v3.0.0 新增
+
+v3.0.0 将管理面板整体重写为 **React + shadcn/ui 单页应用**（`webui-new/`）：
+
+- **全新 WebUI** — Vite + React 18 + TypeScript + shadcn/ui，6 个页面（登录 / 概览 / 账号池 / Playground / 设置 / 404），明暗主题切换，Recharts 实时趋势图
+- **新增后端接口** — `GET /admin/api/history`（30 秒滚动窗口的请求量 / 延迟时序）、`GET /admin/api/env`（脱敏后的运行时配置视图）
+- **构建方式** — 进入 `webui-new/` 执行 `npm install && npm run build`（Windows 也可用 `build.bat`），产物输出到 `webui-new/dist/`；未构建时访问 `/webui` 会返回构建提示 JSON
+- API 端点（`/v1/*`、`/admin/api/*`）完全向后兼容；唯一破坏性变化是 WebUI 产物目录从 `webui/` 变为 `webui-new/dist/`
+
+---
+
 ## v2.2.0 新增
 
 v2.2.0 在保持向后兼容的同时引入了大量安全和功能改进：
@@ -163,11 +174,18 @@ curl http://localhost:8080/v1/models \
 
 ### 管理面板
 
-项目内置 Web 管理界面，提供请求统计和账号池管理功能：
+项目内置 Web 管理界面（v3.0.0 起为 React SPA），提供请求统计和账号池管理功能：
 
 ```
 浏览器打开 http://localhost:8080/webui/
 ```
+
+> **构建提示（v3.0.0）**：WebUI 源码位于 `webui-new/`，首次使用前需构建：
+> ```bash
+> cd webui-new
+> npm install && npm run build   # Windows 也可直接运行 build.bat
+> ```
+> 构建产物输出到 `webui-new/dist/`。未构建时访问 `/webui` 会返回构建提示 JSON（API 功能不受影响）。
 
 默认密码为 `.env` 中设置的 `DEEPSEEK_ADMIN_PASSWORD`（未设置则为 `admin`）。公网部署前请务必修改默认密码。
 
