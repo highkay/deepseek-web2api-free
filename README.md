@@ -8,6 +8,20 @@
 
 ---
 
+## v3.2.0 新增
+
+2026-08 维护版本（基于 v3.0.0），主要改进：
+
+- **start.bat 一键启动重构**：自动检测/创建虚拟环境（`.venv`/`venv`/`env`）、校验并自动安装依赖、WebUI 产物缺失时自动 `npm` 构建、启动前打印访问地址并默认 3 秒后自动打开浏览器（`WEBUI_OPEN=0` 跳过）；端口占用只结束本项目进程（用 PowerShell 替代已废弃的 `wmic`）
+- **WebUI 大修**：修复静态资源 404 白屏（vite `base: '/webui/'` + react-router `basename`）、7 处功能 bug 修复与界面美化、Playground 重写（参数与 DeepSeek 真实转发字段对应、移除无效的温度滑块、推理过程可视化、快速/专家两种模型模式）
+- **鉴权**：`/v1/*` 接受有效 admin 会话 token——webui 登录后可直接调用模型列表与 Playground，不再被登出
+- **账号池**：`.env` 凭证改为池空时的只读兜底（面板账号优先，池空不 503）
+- **上游空响应加固**：上游偶发返回空 SSE 时自动换新会话重试一次，仍空则明确报错（非流式 502 / 流式错误帧），不再静默返回空内容
+- **适配器**：`X-Client-Version` 对齐浏览器（2.3.0）、移除过时的 `X-App-Version`；逆向记录上游 `x-hif-*` 签名头机制
+- 完整变更见 [docs/release-notes/v3.2.0.md](docs/release-notes/v3.2.0.md)
+
+---
+
 ## v3.0.0 新增
 
 v3.0.0 将管理面板整体重写为 **React + shadcn/ui 单页应用**（`webui-new/`）：
