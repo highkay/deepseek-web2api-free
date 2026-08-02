@@ -54,6 +54,15 @@ def _verify_token(token: str) -> bool:
     return matched
 
 
+def verify_admin_token(token: str | None) -> bool:
+    """Public check: is this a valid admin-session token?
+
+    Used by server.py so authenticated webui sessions can also call the
+    /v1/* endpoints (model list, chat) with the same bearer token.
+    """
+    return _verify_token(token or "")
+
+
 # ── Login throttling ──────────────────────────────────────────
 # Per-IP sliding window: at most _LOGIN_MAX failures per _LOGIN_WINDOW seconds.
 _LOGIN_MAX = 5

@@ -21,7 +21,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from adapter import DeepSeekAdapter
-from admin import router as admin_router, get_pool, get_stats, is_admin_password_weak
+from admin import (
+    router as admin_router,
+    get_pool,
+    get_stats,
+    is_admin_password_weak,
+    verify_admin_token,
+)
 from stats_history import start_sampler
 from tool_dsml import (
     parse_dsml_tool_calls,
@@ -104,9 +110,15 @@ def _client_ip(request: Request) -> str:
 def _check_api_auth(request: Request):
     if ALLOW_UNAUTHENTICATED_API:
         return
+    # A valid admin-session token is accepted too: the webui signs its
+    # /v1 calls (model list, Playground) with the same bearer token that
+    # authenticated the admin session, and anyone holding it already has
+    # full control of the account pool.
+    supplied = _extract_api_key(request)
+    if supplied and verify_admin_token(supplied):
+        return
     if not API_KEYS:
         raise HTTPException(status_code=503, detail="API key authentication is not configured")
-    supplied = _extract_api_key(request)
     if not supplied:
         raise HTTPException(status_code=401, detail="Missing API key")
     if not any(secrets.compare_digest(supplied, key) for key in API_KEYS):
