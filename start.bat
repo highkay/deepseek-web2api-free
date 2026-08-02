@@ -1,62 +1,159 @@
 @echo off
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+title DeepSeek Chat API Proxy Server
 
-if "%PORT%"=="" set PORT=8080
-if "%HOST%"=="" set HOST=127.0.0.1
+:: ============================================================
+::  0. Ä¬ÈÏÅäÖÃ£¨¿ÉÓÃÏµÍ³»·¾³±äÁ¿ PORT / HOST ¸²¸Ç£©
+:: ============================================================
+if "%PORT%"=="" set "PORT=8080"
+if "%HOST%"=="" set "HOST=127.0.0.1"
+set "REQ=requirements.txt"
 
-echo ========================================
-echo   DeepSeek Chat API Proxy Server
-echo   HOST=%HOST%  PORT=%PORT%
-echo ========================================
+echo ==================================================
+echo    DeepSeek Chat API Proxy Æô¶¯Æ÷
+echo    HOST=%HOST%    PORT=%PORT%
+echo ==================================================
 echo.
 
-:: ---------------------------------------------------------------------------
-:: Kill any process occupying the configured port, but only if we can verify
-:: it actually IS our process (or is unknown). The previous version of this
-:: script blindly `taskkill /F`'d whatever held the port â€” which is unsafe
-:: because port 8080 is also used by IDEs, Tomcat, web servers, etc.
-:: ---------------------------------------------------------------------------
+:: ============================================================
+::  1. ¶¨Î»ÏµÍ³ Python£¨Ğè 3.10+£©
+:: ============================================================
+set "PYTHON="
+where python >nul 2>&1 && set "PYTHON=python"
+if not defined PYTHON where py >nul 2>&1 && set "PYTHON=py"
+if not defined PYTHON goto :no_python
+"%PYTHON%" --version >nul 2>&1 || goto :no_python
+"%PYTHON%" -c "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)" >nul 2>&1 || goto :old_python
+for /f "tokens=*" %%v in ('"%PYTHON%" --version 2^>^&1') do set "PYVER=%%v"
+echo [1/5] ÏµÍ³ Python: !PYVER!
+echo.
+
+:: ============================================================
+::  2. ²éÕÒ»ò´´½¨ĞéÄâ»·¾³£¨ÓÅÏÈ .venv£¬Æä´Î venv / env£©
+:: ============================================================
+set "VENV="
+if exist ".venv\Scripts\python.exe" set "VENV=.venv"
+if not defined VENV if exist "venv\Scripts\python.exe" set "VENV=venv"
+if not defined VENV if exist "env\Scripts\python.exe" set "VENV=env"
+if defined VENV (
+    echo [2/5] ¼ì²âµ½ĞéÄâ»·¾³: %VENV%
+) else (
+    echo [2/5] Î´ÕÒµ½ĞéÄâ»·¾³£¬ÕıÔÚ´´½¨ .venv ...
+    "%PYTHON%" -m venv .venv
+    if errorlevel 1 (
+        echo        ´´½¨ .venv Ê§°Ü£¬³¢ÊÔ venv ...
+        "%PYTHON%" -m venv venv
+        if errorlevel 1 goto :venv_failed
+        set "VENV=venv"
+    ) else (
+        set "VENV=.venv"
+    )
+    echo        ĞéÄâ»·¾³ÒÑ´´½¨: !VENV!
+)
+set "PY=%VENV%\Scripts\python.exe"
+if not exist "%PY%" goto :venv_failed
+echo.
+
+:: ============================================================
+::  3. Ğ£ÑéÒÀÀµ£¨²»×ãÔò×Ô¶¯°²×°£©
+:: ============================================================
+set "CHK=%TEMP%\ds2api_pipchk_%RANDOM%.txt"
+echo [3/5] ÕıÔÚĞ£Ñé %VENV% ÖĞµÄÒÀÀµ ...
+"%PY%" -m pip install --dry-run -r "%REQ%" > "%CHK%" 2>&1
+set "DRY_RC=!errorlevel!"
+findstr /i "would install" "%CHK%" >nul 2>&1
+set "NEED=!errorlevel!"
+del "%CHK%" >nul 2>&1
+if !DRY_RC! equ 0 if !NEED! equ 1 (
+    echo        ÒÀÀµÒÑÆëÈ«£¬Ìø¹ı°²×°¡£
+) else (
+    echo        ÒÀÀµÈ±Ê§»òĞ£ÑéÊ§°Ü£¬ÕıÔÚ°²×° ...
+    if !DRY_RC! neq 0 echo        £¨pip Ğ£ÑéÎ´Í¨¹ı¡ª¡ª¿ÉÄÜÀëÏß»ò pip ¹ı¾É£¬½«Ö±½Ó°²×°£©
+    "%PY%" -m pip install --upgrade pip >nul 2>&1
+    "%PY%" -m pip install -r "%REQ%"
+    if errorlevel 1 goto :deps_failed
+    echo        ÒÀÀµ°²×°Íê³É¡£
+)
+echo.
+
+:: ============================================================
+::  4. ÊÍ·Å¶Ë¿Ú£¨Ö»É±±¾ÏîÄ¿µÄ½ø³Ì£¬¾ø²»ÎóÉ±ËûÈË£©
+:: ============================================================
+echo [4/5] ¼ì²é¶Ë¿Ú %PORT% ...
+set "BLOCKED="
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%PORT% " ^| findstr LISTENING') do (
     set "PID=%%a"
-    set "IS_OURS=0"
-
-    :: Try to read the command line of the process holding the port.
-    for /f "tokens=*" %%c in ('wmic process where "ProcessId=%%a" get CommandLine /format:list 2^>nul ^| findstr /c:"CommandLine="') do (
-        set "CMDLINE=%%c"
-        :: Strip the "CommandLine=" prefix.
-        set "CMDLINE=!CMDLINE:~13!"
-        echo   PID %%a command: !CMDLINE!
-        :: Match if it looks like our server (uvicorn, server.py, etc.).
-        echo !CMDLINE! | findstr /i "uvicorn server.py ds2api" >nul && set "IS_OURS=1"
-    )
-
-    if "!IS_OURS!"=="1" (
-        echo Killing OUR process %%a holding port %PORT% ...
-        taskkill /F /PID %%a >nul 2>&1
-        if !errorlevel! neq 0 (
-            taskkill /F /PID %%a /T >nul 2>&1
+    set "CMDLINE="
+    for /f "usebackq tokens=*" %%c in (`powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=%%a').CommandLine" 2^>nul`) do set "CMDLINE=%%c"
+    if defined CMDLINE (
+        echo        ¶Ë¿Ú %PORT% ±» PID !PID! Õ¼ÓÃ£¬ÃüÁîĞĞ: !CMDLINE!
+        echo !CMDLINE! | findstr /i "uvicorn server:app server.py ds2api" >nul
+        if !errorlevel! equ 0 (
+            echo        ÊÇ±¾ÏîÄ¿½ø³Ì£¬½áÊøËü ...
+            taskkill /F /PID !PID! >nul 2>&1
+            if !errorlevel! neq 0 taskkill /F /T /PID !PID! >nul 2>&1
+            ping -n 2 127.0.0.1 >nul
+        ) else (
+            echo        ¸Ã½ø³ÌÓë±¾ÏîÄ¿ÎŞ¹Ø£¬¾Ü¾ø½áÊø¡£
+            set "BLOCKED=1"
         )
     ) else (
-        echo.
-        echo   ============================================================
-        echo   Port %PORT% is held by PID %%a, but it is NOT a ds2api process.
-        echo   Refusing to kill it. Either:
-        echo     * free the port yourself (e.g. stop the other service), or
-        echo     * run this script with a different PORT:
-        echo         set PORT=9090 ^&^& start.bat
-        echo   ============================================================
-        echo.
-        pause
-        exit /b 1
+        echo        ¶Ë¿Ú %PORT% ±» PID !PID! Õ¼ÓÃ£¬µ«ÎŞ·¨¶ÁÈ¡ÆäÃüÁîĞĞ£¬¾Ü¾ø×Ô¶¯½áÊø¡£
+        set "BLOCKED=1"
     )
 )
-timeout /t 1 /nobreak >nul
+if defined BLOCKED (
+    echo.
+    echo   ============================================================
+    echo   ¶Ë¿Ú %PORT% ±»ÆäËû½ø³ÌÕ¼ÓÃ£¬ÇÒ²»ÊÇ±¾·şÎñ¡£
+    echo   Çë×ÔĞĞÊÍ·Å¶Ë¿Ú£¬»ò»»Ò»¸ö¶Ë¿ÚÆô¶¯£º
+    echo       set PORT=9090 ^&^& start.bat
+    echo   ============================================================
+    echo.
+    pause
+    exit /b 1
+)
+echo.
 
-echo Starting server on %HOST%:%PORT% ...
-python -m uvicorn server:app --host %HOST% --port %PORT%
+:: ============================================================
+::  5. Æô¶¯·şÎñ
+:: ============================================================
+echo [5/5] ÕıÔÚÆô¶¯·şÎñ %HOST%:%PORT% ...
+echo.
+"%PY%" -m uvicorn server:app --host %HOST% --port %PORT%
 if errorlevel 1 (
     echo.
-    echo Failed to start. Reason: port %PORT% occupied or missing deps.
+    echo   ·şÎñÒì³£ÍË³ö£¬Çë²é¿´ÉÏ·½ÈÕÖ¾¡£
     pause
 )
+exit /b %errorlevel%
+
+:: ---------- ´íÎó´¦Àí ----------
+:no_python
+echo.
+echo [´íÎó] Î´ÕÒµ½ Python 3.10+£¨ÒÑ³¢ÊÔ "python" ºÍ "py"£©¡£
+echo        Çë´Ó https://www.python.org/downloads/ °²×°²¢¼ÓÈë PATH¡£
+pause
+exit /b 1
+
+:old_python
+echo.
+echo [´íÎó] ĞèÒª Python 3.10+£¬µ±Ç°°æ±¾:
+"%PYTHON%" --version
+pause
+exit /b 1
+
+:venv_failed
+echo.
+echo [´íÎó] ĞéÄâ»·¾³´´½¨/Ê¹ÓÃÊ§°Ü¡£
+echo        ¿ÉÊÖ¶¯Ö´ĞĞ: "%PYTHON%" -m venv .venv
+pause
+exit /b 1
+
+:deps_failed
+echo.
+echo [´íÎó] ÒÀÀµ°²×°Ê§°Ü£¬Çë²é¿´ÉÏ·½ÈÕÖ¾¡£
+echo        ¿ÉÊÖ¶¯Ö´ĞĞ: "%PY%" -m pip install -r "%REQ%"
+pause
+exit /b 1

@@ -149,7 +149,10 @@ SEARCH=auto
 # 方式一：直接启动（使用 .env 中的 PORT 配置）
 python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}
 
-# 方式二：使用启动脚本（会自动杀掉占用配置端口的进程）
+# 方式二：使用启动脚本 start.bat（推荐）
+#   - 自动检测 / 创建虚拟环境（.venv，其次 venv / env）
+#   - 自动校验依赖，不足则安装
+#   - 只结束本项目的旧进程，绝不误杀占用端口的其他服务
 start.bat
 ```
 
