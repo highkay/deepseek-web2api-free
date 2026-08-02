@@ -43,8 +43,17 @@ export function AccountTable({ accounts, onEdit, onDelete, onSelect }: Props) {
           return (
             <TableRow
               key={a.id}
-              className="cursor-pointer"
+              className="cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               onClick={() => onSelect(a)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onSelect(a)
+                }
+              }}
+              tabIndex={0}
+              role="button"
+              aria-label={`查看账号 ${a.email || a.id}`}
             >
               <TableCell>
                 <Tooltip>

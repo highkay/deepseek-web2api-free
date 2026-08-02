@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, type CSSProperties } from 'react'
 import { Send, Square, Trash2, FlaskConical } from 'lucide-react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Button } from '@/components/ui/button'
@@ -6,6 +6,16 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { useToast } from '@/hooks/use-toast'
 import { useAuthStore } from '@/stores/auth'
 import { ApiCallError } from '@/lib/api'
@@ -30,7 +40,11 @@ export default function PlaygroundPage() {
   const [history, setHistory] = useState<ChatMessage[]>([])
   const [streaming, setStreaming] = useState<string | undefined>(undefined)
   const [busy, setBusy] = useState(false)
+  const [clearOpen, setClearOpen] = useState(false)
   const acRef = useRef<AbortController | null>(null)
+  // Tracks the accumulated streamed text so handlers (e.g. stop/abort)
+  // can read the *latest* value instead of the stale render closure.
+  const accRef = useRef('')
 
   useEffect(() => () => acRef.current?.abort(), [])
 
@@ -79,13 +93,35 @@ export default function PlaygroundPage() {
       const decoder = new TextDecoder()
       let buf = ''
       let acc = ''
+      accRef.current = ''
 
-      // Parse SSE: events separated by "\n\n", each "data: <json>" line.
-      // "data: [DONE]" terminates.
+      // Parse a single "data: <json>" payload and accumulate its text.
+      const handleEvent = (payload: string) => {
+        if (payload === '[DONE]') return
+        try {
+          const obj = JSON.parse(payload)
+          const choice = obj.choices?.[0]
+          if (!choice) return
+          const delta = choice.delta ?? {}
+          if (delta.reasoning_content) {
+            acc += delta.reasoning_content
+          } else if (delta.content) {
+            acc += delta.content
+          }
+          accRef.current = acc
+          setStreaming(acc)
+        } catch {
+          // ignore malformed chunk
+        }
+      }
+
+      // Parse SSE: events separated by a blank line, each "data: <json>"
+      // line; "data: [DONE]" terminates. CRLF is normalised so the split
+      // works no matter which line ending the transport uses.
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        buf += decoder.decode(value, { stream: true })
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
 
         let sep
         while ((sep = buf.indexOf('\n\n')) !== -1) {
@@ -94,23 +130,17 @@ export default function PlaygroundPage() {
           for (const line of event.split('\n')) {
             const trimmed = line.trim()
             if (!trimmed.startsWith('data:')) continue
-            const payload = trimmed.slice(5).trim()
-            if (payload === '[DONE]') continue
-            try {
-              const obj = JSON.parse(payload)
-              const choice = obj.choices?.[0]
-              if (!choice) continue
-              const delta = choice.delta ?? {}
-              if (delta.reasoning_content) {
-                acc += delta.reasoning_content
-              } else if (delta.content) {
-                acc += delta.content
-              }
-              setStreaming(acc)
-            } catch {
-              // ignore malformed chunk
-            }
+            handleEvent(trimmed.slice(5).trim())
           }
+        }
+      }
+
+      // Flush a trailing event that reached EOF without a closing blank line.
+      if (buf.trim()) {
+        for (const line of buf.split('\n')) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          handleEvent(trimmed.slice(5).trim())
         }
       }
 
@@ -119,7 +149,12 @@ export default function PlaygroundPage() {
       setStreaming(undefined)
     } catch (e) {
       if (ac.signal.aborted) {
-        setHistory([...nextHistory, { role: 'assistant', content: streaming ?? '' }])
+        const partial = accRef.current.trim()
+        if (partial) {
+          setHistory([...nextHistory, { role: 'assistant', content: accRef.current }])
+        } else {
+          setHistory(nextHistory)
+        }
       } else {
         const msg = e instanceof ApiCallError ? e.message : String(e)
         toast({ title: '请求失败', description: msg, variant: 'destructive' })
@@ -136,10 +171,9 @@ export default function PlaygroundPage() {
   }
 
   const handleClear = () => {
-    if (history.length === 0) return
-    if (!confirm('清空所有对话？')) return
     setHistory([])
     setStreaming(undefined)
+    setClearOpen(false)
   }
 
   return (
@@ -148,7 +182,11 @@ export default function PlaygroundPage() {
         title="Playground"
         description="在线测试 /v1/chat/completions（需要 .env 配置 API_KEYS）"
         actions={
-          <Button variant="outline" onClick={handleClear} disabled={history.length === 0 || busy}>
+          <Button
+            variant="outline"
+            onClick={() => setClearOpen(true)}
+            disabled={history.length === 0 || busy}
+          >
             <Trash2 className="h-4 w-4" />
             清空
           </Button>
@@ -193,6 +231,7 @@ export default function PlaygroundPage() {
                 value={temperature}
                 onChange={(e) => setTemperature(parseFloat(e.target.value))}
                 className="w-full"
+                style={{ '--range-fill': `${(temperature / 2) * 100}%` } as CSSProperties}
               />
             </div>
 
@@ -237,8 +276,27 @@ export default function PlaygroundPage() {
               </Button>
             )}
           </div>
+          <div className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
+            Enter 发送 · Shift+Enter 换行 · 模型与参数见左侧
+          </div>
         </Card>
       </div>
+
+      {/* Clear-confirm dialog */}
+      <AlertDialog open={clearOpen} onOpenChange={setClearOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>清空所有对话？</AlertDialogTitle>
+            <AlertDialogDescription>此操作将删除当前会话中的所有消息，不可恢复。</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={handleClear} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+              确认清空
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

@@ -7,7 +7,6 @@ import AccountsPage from '@/pages/AccountsPage'
 import PlaygroundPage from '@/pages/PlaygroundPage'
 import SettingsPage from '@/pages/SettingsPage'
 import NotFoundPage from '@/pages/NotFoundPage'
-import { Spinner } from '@/components/ui/spinner'
 
 /** Wrapper that redirects to /login if there's no token. */
 function RequireAuth() {
@@ -42,5 +41,3 @@ const router = createBrowserRouter([
 export function App() {
   return <RouterProvider router={router} />
 }
-
-export { Spinner }

@@ -8,6 +8,7 @@ import {
   Users,
   KeyRound,
   Coins,
+  BarChart3,
 } from 'lucide-react'
 import { useApi } from '@/hooks/useApi'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -18,7 +19,7 @@ import { PoolStatusCard } from '@/components/stats/PoolStatusCard'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ApiCallError } from '@/lib/api'
-import { formatLatency, formatNumber, formatPercent, formatUptime, stateLabel } from '@/lib/utils'
+import { formatLatency, formatNumber, formatPercent, formatUptime } from '@/lib/utils'
 import type { AccountsResponse, HistoryResponse, StatsResponse } from '@/lib/types'
 
 export default function DashboardPage() {
@@ -240,11 +241,9 @@ function ChartError({ err }: { err: ApiCallError }) {
 
 function EmptyChart() {
   return (
-    <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
+    <div className="flex h-64 flex-col items-center justify-center text-sm text-muted-foreground">
+      <BarChart3 className="mb-2 h-6 w-6 opacity-50" />
       暂无数据
     </div>
   )
 }
-
-// Re-export for parity with sidebar item labels.
-void stateLabel

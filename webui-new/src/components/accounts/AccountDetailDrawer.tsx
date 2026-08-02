@@ -1,4 +1,4 @@
-import { ExternalLink, Copy } from 'lucide-react'
+import { Copy } from 'lucide-react'
 import {
   Sheet,
   SheetContent,
@@ -117,12 +117,6 @@ export function AccountDetailDrawer({ account, onClose, onRelogin }: Props) {
                 {account.state === 'error' && (
                   <ReloginButton accountId={account.id} onDone={onRelogin} />
                 )}
-                <Button variant="outline" asChild>
-                  <a href={`/admin/api/accounts`} target="_blank" rel="noreferrer">
-                    <ExternalLink className="h-3.5 w-3.5" />
-                    查看 API
-                  </a>
-                </Button>
               </div>
             </div>
           </>

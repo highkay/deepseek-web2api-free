@@ -109,3 +109,50 @@
     border-radius: 3px;
   }
 }
+
+/* ── Range slider (temperature etc.) ────────────────────────── */
+@layer components {
+  input[type='range'] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 9999px;
+    background: linear-gradient(
+      to right,
+      hsl(var(--primary)) var(--range-fill, 50%),
+      hsl(var(--border)) var(--range-fill, 50%)
+    );
+    cursor: pointer;
+    outline: none;
+  }
+  input[type='range']:focus-visible {
+    box-shadow: 0 0 0 2px hsl(var(--ring) / 0.4);
+  }
+  input[type='range']::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 16px;
+    width: 16px;
+    border-radius: 9999px;
+    background: hsl(var(--background));
+    border: 2px solid hsl(var(--primary));
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25);
+    transition: transform 0.1s ease;
+  }
+  input[type='range']::-webkit-slider-thumb:hover {
+    transform: scale(1.12);
+  }
+  input[type='range']::-moz-range-thumb {
+    height: 16px;
+    width: 16px;
+    border-radius: 9999px;
+    background: hsl(var(--background));
+    border: 2px solid hsl(var(--primary));
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25);
+  }
+  input[type='range']::-moz-range-progress {
+    height: 6px;
+    border-radius: 9999px;
+    background: hsl(var(--primary));
+  }
+}

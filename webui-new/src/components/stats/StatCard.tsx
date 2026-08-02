@@ -1,4 +1,5 @@
 import { Card, CardContent } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import type { LucideIcon } from 'lucide-react'
 
@@ -29,8 +30,8 @@ export function StatCard({ label, value, hint, icon: Icon, tone = 'default', loa
           </div>
           {Icon && <Icon className="h-4 w-4 text-muted-foreground/60" />}
         </div>
-        <div className={cn('mt-2 text-2xl font-bold tabular-nums', toneClass[tone])}>
-          {loading ? '—' : value}
+        <div className={cn('mt-2 text-2xl font-bold tabular-nums', !loading && toneClass[tone])}>
+          {loading ? <Skeleton className="h-7 w-16" /> : value}
         </div>
         {hint && <div className="mt-1 text-xs text-muted-foreground">{hint}</div>}
       </CardContent>

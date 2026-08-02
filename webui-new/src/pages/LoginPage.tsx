@@ -60,7 +60,7 @@ export default function LoginPage() {
 
       <form
         onSubmit={handleSubmit}
-        className="w-full max-w-sm rounded-xl border bg-card p-8 shadow-lg animate-fade-in"
+        className="w-full max-w-sm rounded-xl border bg-card p-8 shadow-lg transition-shadow duration-200 hover:shadow-xl animate-fade-in"
       >
         <div className="mb-6 flex flex-col items-center gap-2">
           <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-primary/60 text-primary-foreground text-xl font-bold shadow-md">

@@ -1,6 +1,5 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { Progress } from '@/components/ui/progress'
 import type { Account } from '@/lib/types'
 import { Link } from 'react-router-dom'
 
@@ -63,9 +62,6 @@ export function PoolStatusCard({ accounts, total, idle, busy, error }: Props) {
             )}
           </div>
         )}
-        {/* Suppress unused-import warning by referencing Progress; the
-            card may want a per-state stacked bar instead later. */}
-        <Progress value={idlePct} className="hidden" />
       </CardContent>
     </Card>
   )
