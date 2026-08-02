@@ -160,6 +160,25 @@ echo.
 :: ============================================================
 echo [6/6] 正在启动服务 %HOST%:%PORT% ...
 echo.
+:: 访问地址：0.0.0.0 / :: 是监听地址，浏览器应访问 127.0.0.1
+set "ACCESS_HOST=%HOST%"
+if "%ACCESS_HOST%"=="0.0.0.0" set "ACCESS_HOST=127.0.0.1"
+echo.
+echo   ============================================================
+echo   服务启动后可通过以下地址访问：
+echo      WebUI 管理面板:  http://%ACCESS_HOST%:%PORT%/webui/
+echo      OpenAI API:      http://%ACCESS_HOST%:%PORT%/v1/chat/completions
+echo      健康检查:        http://%ACCESS_HOST%:%PORT%/health
+echo   管理密码: 见 .env 中 DEEPSEEK_ADMIN_PASSWORD 设置
+echo   ============================================================
+echo.
+if not "%WEBUI_OPEN%"=="0" (
+    echo   3 秒后自动打开浏览器（跳过自动打开请先执行: set WEBUI_OPEN=0）
+    start "" powershell -NoProfile -Command "Start-Sleep -Seconds 3; Start-Process 'http://%ACCESS_HOST%:%PORT%/webui/'"
+) else (
+    echo   已跳过自动打开浏览器（WEBUI_OPEN=0）。
+)
+echo.
 "%PY%" -m uvicorn server:app --host %HOST% --port %PORT%
 if errorlevel 1 (
     echo.

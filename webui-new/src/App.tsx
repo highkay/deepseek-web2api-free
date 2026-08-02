@@ -18,6 +18,8 @@ function RequireAuth() {
   return <Outlet />
 }
 
+// basename: '/webui' — the SPA is served under /webui/* by the backend,
+// so client-side navigation keeps the prefix and deep links refresh cleanly.
 const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
   {
@@ -36,7 +38,7 @@ const router = createBrowserRouter([
       },
     ],
   },
-])
+], { basename: '/webui' })
 
 export function App() {
   return <RouterProvider router={router} />

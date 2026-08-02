@@ -4,8 +4,13 @@ import path from 'node:path'
 
 // Vite config — dev server proxies /admin/api and /v1/* to the FastAPI
 // backend on :8080 so the React app can be developed without CORS.
+//
+// base: '/webui/' — the FastAPI backend serves the built SPA under
+// /webui/*, so built asset URLs must carry that prefix (the default '/'
+// would make /assets/* 404 against the backend).
 export default defineConfig({
   plugins: [react()],
+  base: '/webui/',
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
