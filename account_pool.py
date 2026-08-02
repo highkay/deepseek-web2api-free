@@ -150,7 +150,9 @@ class AccountPool:
             configured_store = Path(__file__).resolve().parent / configured_store
         self._store_path = configured_store
         self._load_persisted_accounts()
-        self._load_env_accounts()
+        # .env credentials are NOT pre-loaded into the pool anymore; they
+        # act as a read-only fallback used only when the pool is empty.
+        self._env_fallback: Optional[Account] = self._load_env_fallback()
 
     # ── Loading / persistence ────────────────────────────────────
 
@@ -203,42 +205,51 @@ class AccountPool:
                 updated_at=updated_at,
             ))
 
-    def _load_env_accounts(self):
-        """Load legacy and numbered accounts from env vars."""
+    def _load_env_fallback(self) -> Optional[Account]:
+        """Read .env credentials as a read-only fallback account.
+
+        Replaces the old `_load_env_accounts` behaviour: the account is
+        NOT added to the pool, so panel-managed accounts take priority
+        and the env credentials are only used when the pool has zero
+        accounts (see `acquire`). Numbered format is tried first
+        (DEEPSEEK_TOKEN_1/COOKIES_1/...), then the legacy single-account
+        format (DEEPSEEK_TOKEN / DEEPSEEK_COOKIES).
+        """
         for i in range(1, 101):
             token = os.environ.get(f"DEEPSEEK_TOKEN_{i}", "").strip()
             cookies = os.environ.get(f"DEEPSEEK_COOKIES_{i}", "").strip()
-            email = os.environ.get(f"DEEPSEEK_EMAIL_{i}", "").strip() or f"env-{i}"
-            proxy = os.environ.get(f"DEEPSEEK_PROXY_{i}", "").strip()
             if not token and not cookies:
                 continue
             if not token or not cookies:
-                print(f"WARNING: Skipping env account {i}: token/cookies must both be set")
+                log.warning("skipping_env_fallback_incomplete", extra={"index": i})
                 continue
-            self._append_loaded(Account(
+            email = os.environ.get(f"DEEPSEEK_EMAIL_{i}", "").strip() or f"env-{i}"
+            proxy = os.environ.get(f"DEEPSEEK_PROXY_{i}", "").strip()
+            return Account(
                 id=f"env-{i}",
                 email=email,
                 token=token,
                 cookies=cookies,
                 proxy=proxy,
                 source="env",
-            ))
+            )
 
         token = os.environ.get("DEEPSEEK_TOKEN", "").strip()
         cookies = os.environ.get("DEEPSEEK_COOKIES", "").strip()
-        email = os.environ.get("DEEPSEEK_EMAIL", "").strip() or "env-default"
-        proxy = os.environ.get("DEEPSEEK_PROXY", "").strip()
         if token and cookies:
-            self._append_loaded(Account(
+            email = os.environ.get("DEEPSEEK_EMAIL", "").strip() or "env-default"
+            proxy = os.environ.get("DEEPSEEK_PROXY", "").strip()
+            return Account(
                 id="env-default",
                 email=email,
                 token=token,
                 cookies=cookies,
                 proxy=proxy,
                 source="env",
-            ))
-        elif token or cookies:
+            )
+        if token or cookies:
             log.warning("skipping_legacy_env_account_incomplete")
+        return None
 
     def _ensure_store_dir(self):
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -370,7 +381,10 @@ class AccountPool:
 
     def get_all(self) -> list[dict]:
         with self._lock:
-            return [a.to_dict() for a in self._accounts]
+            items = [a.to_dict() for a in self._accounts]
+            if self._env_fallback is not None:
+                items.append(self._env_fallback.to_dict())
+            return items
 
     def count(self) -> int:
         with self._lock:
@@ -379,9 +393,19 @@ class AccountPool:
     # ── Selection ──────────────────────────────────────────────
 
     def acquire(self) -> Optional[Account]:
-        """Get the next idle account (round-robin), or None if all busy."""
+        """Get the next idle account (round-robin), or None if all busy.
+
+        When the pool has no accounts at all, falls back to the .env
+        credentials (read-only fallback) so the service keeps working
+        until panel accounts are added.
+        """
         with self._lock:
             if not self._accounts:
+                fb = self._env_fallback
+                if fb is not None and fb.state == "idle":
+                    fb.state = "busy"
+                    fb.last_used = time.time()
+                    return fb
                 return None
             n = len(self._accounts)
             for _ in range(n):
@@ -485,10 +509,13 @@ class AccountPool:
 
     def stats(self) -> dict:
         with self._lock:
-            total = len(self._accounts)
-            idle = sum(1 for a in self._accounts if a.state == "idle")
-            busy = sum(1 for a in self._accounts if a.state == "busy")
-            error = sum(1 for a in self._accounts if a.state == "error")
+            accounts = list(self._accounts)
+            if self._env_fallback is not None:
+                accounts.append(self._env_fallback)
+            total = len(accounts)
+            idle = sum(1 for a in accounts if a.state == "idle")
+            busy = sum(1 for a in accounts if a.state == "busy")
+            error = sum(1 for a in accounts if a.state == "error")
             return {
                 "total": total,
                 "idle": idle,

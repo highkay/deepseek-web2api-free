@@ -1812,9 +1812,14 @@ def check_health(acct) -> bool:
 
 `AccountPool` 使用 `threading.Lock` 保护所有状态变更操作（CRUD、状态切换）。`_WASMSolver` 已有独立锁，两把锁不会形成死锁（无嵌套加锁）。
 
-### 15.7 初始加载
+### 15.7 初始加载与 env 兜底
 
-启动时从 `DEEPSEEK_TOKEN` / `DEEPSEEK_COOKIES` 环境变量加载默认账号，适用于单账号场景。多账号通过管理面板或 Admin API 添加。
+- **池内账号**：启动时从 `data/accounts.json`（面板持久化）加载；面板/Admin API 增删改。
+- **env 兜底**：`.env` 中的凭证（numbered `DEEPSEEK_TOKEN_1/...` 优先，legacy `DEEPSEEK_TOKEN`/`DEEPSEEK_COOKIES` 其次）**不再预加载进池**，而是作为只读兜底账号（id=`env-*`，source=`env`，`read_only=true`）：
+  - 池内**有**账号时：只用池内账号（面板账号优先）
+  - 池内**0**个账号时：`acquire()` 返回 env 兜底账号，服务不因池空而 503
+  - webui 账号池页显示该条目（灰色只读），删除接口对 `env-*` 无效（不在池内，返回 404）
+  - 实现：`AccountPool._env_fallback`（`_load_env_fallback()`），`acquire()` 池空分支、`get_all()`/`stats()` 含兜底账号
 
 ---
 
