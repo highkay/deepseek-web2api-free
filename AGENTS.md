@@ -4,6 +4,24 @@
 
 ---
 
+## v3.0.0 + 2026-08 维护变更摘要
+
+### v3.0.0（2026-06）：React WebUI 重写
+
+- 管理面板从 vanilla JS 重写为 **Vite + React 18 + TypeScript + shadcn/ui** SPA（`webui-new/`），6 个页面（登录 / 概览 / 账号池 / Playground / 设置 / 404）
+- 新增 `stats_history.py`（30s 快照滚动窗口）、`GET /admin/api/history`、`GET /admin/api/env`
+- WebUI 产物位于 `webui-new/dist/`，由 `server.py` 在 `/webui/*` 下伺服；旧 `webui/` 已删除
+- **构建要求**：vite `base: '/webui/'` + react-router `basename: '/webui'`，两者缺失会导致资源 404 白屏
+
+### 2026-08 维护（start.bat / 鉴权 / Playground）
+
+- **start.bat 重构**：自动定位 Python 3.10+、检测/创建虚拟环境（`.venv`/`venv`/`env`）、`pip install --dry-run` 校验依赖并自动安装、WebUI dist 缺失时自动 `npm` 构建（`WEBUI_REBUILD=1` 强制重建）、启动前打印访问地址并默认 3s 后自动打开浏览器（`WEBUI_OPEN=0` 跳过）、端口占用只杀本项目进程（用 PowerShell `Get-CimInstance` 读命令行替代已废弃的 `wmic`）
+- **鉴权**：`/v1/*` 的 `_check_api_auth` 现在也接受有效 admin 会话 token（`verify_admin_token`），webui 用同一 token 调模型列表与 Playground
+- **Playground 重写**：参数只保留后端真实转发的字段（`model` ↔ `model_type`、`thinking_mode` ↔ `thinking_enabled`、`search_enabled`）；temperature/top_p/max_tokens 后端忽略故不再提供；流式 `reasoning_content` 可视化（"推理过程"折叠块）
+- **已知环境事实**：`wmic` 已在 Win11 24H2+ 移除；`timeout` 命令与 Git Bash 的 GNU coreutils 冲突（脚本用 `ping -n 2` 延时）
+
+---
+
 ## v2.2.0 变更摘要（2026-06）
 
 新增模块：`logger.py`、`crypto.py`、`ip_utils.py`、`token_counter.py`、
@@ -78,8 +96,8 @@
 
 ### 1.3 项目版本
 
-- 开源版：`v2.0.0` — 基础功能 + 工具调用
-- 预览版 (--pre)：`v2.2.0-pre` — 基础功能 + 工具调用 + 专家模式 + 联网搜索 + 可配置端口
+- 当前主线：`v3.0.0`（2026-06）— 基础功能 + 工具调用 + 专家模式 + 联网搜索 + React WebUI 管理面板
+- 自 v3.0.0 起开源版与预览版已合并为单一主线，无独立 `--pre` 分支
 
 ---
 
@@ -95,11 +113,9 @@ D:\the llaa\DS反代 --pre\
 ├── tool_dsml.py           # DSML 格式解析器（工具调用协议）
 ├── tool_sieve.py          # 流式筛分引擎（实时检测工具调用标签）
 ├── sha3_wasm_bg.wasm      # PoW 哈希引擎 WASM 二进制
-├── start.bat              # Windows 一键启动脚本
-├── webui/                 # 管理面板前端（纯静态 SPA，零 build 依赖）
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
+├── start.bat              # Windows 一键启动脚本（自动 venv/依赖/WebUI/开浏览器）
+├── webui-new/             # 管理面板前端（v3.0.0+，React SPA，需 npm 构建）
+│   └── dist/              #   构建产物（gitignored），server.py 伺服于 /webui/*
 ├── .env                   # 环境配置（含 TOKEN/COOKIE，不提交）
 ├── .env.example           # 配置模板（提交到仓库）
 ├── requirements.txt       # Python 依赖
@@ -128,8 +144,8 @@ D:\the llaa\DS反代 --pre\
 | 文件 | 用途 |
 |------|------|
 | `sha3_wasm_bg.wasm` | PoW 哈希引擎 WASM 二进制，从 DeepSeek 前端 JavaScript 中提取。通过 `wasmtime` 加载，导出 `wasm_solve` 等函数。版本与 DeepSeek 前端发布绑定。 |
-| `start.bat` | Windows 一键启动脚本。自动检测并释放 `PORT` 环境变量指定的端口（默认 8080），然后启动 uvicorn。如果端口被其他进程占用，会先强制终止该进程及其子进程。 |
-| `webui/` | 管理面板前端（纯静态 SPA）。包含 `index.html`、`app.js`、`style.css`。零 npm/build 依赖，通过 FastAPI 静态文件挂载在 `/webui/` 路径。 |
+| `start.bat` | Windows 一键启动脚本（GBK 编码 + CRLF，勿改编码）。流程：定位 Python 3.10+ → 检测/创建虚拟环境（`.venv`/`venv`/`env`）→ `pip install --dry-run` 校验依赖（缺失自动安装）→ WebUI dist 缺失时自动 `npm` 构建 → 端口检查（只杀命令行匹配 `uvicorn`/`server:app`/`server.py`/`ds2api` 的本项目进程，其他进程拒绝杀并提示）→ 打印访问地址并默认 3s 后自动打开浏览器（`WEBUI_OPEN=0` 跳过）。支持 `PORT`/`HOST` 环境变量覆盖。 |
+| `webui-new/` | 管理面板前端（v3.0.0+，Vite + React 18 + TypeScript + shadcn/ui SPA）。源码构建产物在 `webui-new/dist/`（gitignored），由 `server.py` 伺服于 `/webui/*`。**必须**以 `base: '/webui/'` + react-router `basename: '/webui'` 构建，否则资源 404。旧版 `webui/`（vanilla）已删除。 |
 | `requirements.txt` | Python 依赖声明。关键依赖版本要求见下表。 |
 | `.env.example` | 环境配置模板。复制为 `.env` 后填入凭证。提交到仓库但不含敏感信息。 |
 
@@ -172,6 +188,8 @@ uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080} --reload
 `--reload` 会在文件变更时自动重启，但注意它不会自动清理 `__pycache__`（见 §18.5）。
 
 ### 2.3 预览版 vs 开源版差异
+
+> **v3.0.0 起已合并**：以下对比仅作历史参考。当前主线同时具备左右两列全部能力（OpenAI + Anthropic + 专家模式 + 联网搜索 + 工具调用 + React WebUI）。
 
 | 维度 | 开源版 (`v2.0.0`) | 预览版 (`v2.2.0-pre`) |
 |------|-------------------|----------------------|
@@ -1807,7 +1825,7 @@ def check_health(acct) -> bool:
 管理后台包含三个部分：
 1. **Admin API** (`admin.py`) — FastAPI APIRouter，挂载在 `/admin/api` 前缀
 2. **AccountPool** (`account_pool.py`) — 账号池核心逻辑
-3. **前端 SPA** (`webui/`) — 纯静态 HTML/CSS/JS，通过 FastAPI 挂载在 `/webui/`
+3. **前端 SPA** (`webui-new/`) — React SPA（v3.0.0+），构建产物 `webui-new/dist/` 由 `server.py` 伺服于 `/webui/*`
 
 所有管理 API 端点（除 `/admin/api/login`）均需要 Bearer Token 认证。
 
@@ -1839,16 +1857,15 @@ def check_health(acct) -> bool:
 
 统计在 `chat()`/`chat_stream()` 调用前后通过 `get_stats().record()` 记录。流式响应在 `finally` 块中确保统计被记录。
 
-### 16.5 前端 SPA
+### 16.5 前端 SPA（v3.0.0+）
 
-- **路由**：`/webui/` → `index.html`，Hash 路由（`#dashboard` / `#accounts`）
-- **技术栈**：纯 HTML + CSS + JavaScript，无 npm/build 依赖
-- **主题**：暗色主题（CSS 自定义属性），蓝色主色调
-- **页面**：
-  - 登录页 → 输入密码 → POST `/admin/api/login` → 保存 token
-  - 概览页 → 请求统计卡片 + 账号池状态一览（含账号 badge）
-  - 账号池页 → 添加表单 + 账号列表表格（状态 badge / 重登录按钮 / 删除按钮）
-- **自动刷新**：概览页每 5s 轮询 `/admin/api/stats` 和 `/admin/api/accounts`，账号页手动刷新
+- **技术栈**：Vite 5 + React 18 + TypeScript + shadcn/ui（Radix + Tailwind）+ Recharts + Zustand + react-router-dom v6
+- **路由**：`createBrowserRouter(..., { basename: '/webui' })`——SPA 位于 `/webui/*`，深链接刷新由 `server.py` 的 `/webui/{rest}` SPA fallback 回 index.html
+- **构建**：`webui-new/` 下 `npm install && npm run build`（或 `scripts/build.bat`），产物 `webui-new/dist/`。vite `base: '/webui/'` 使资源引用带前缀（改回 `/` 会导致 JS/CSS 404 白屏）
+- **鉴权**：admin token 存 `localStorage`（zustand persist，key `ds2api-auth`）；`api()` 包装器统一带 `Authorization: Bearer <admin-token>`，401 自动 logout 跳 `/login`。`/v1/*` 现也接受该 admin token（见 13.1/18.1）
+- **页面**：登录 / 概览（统计卡 + 请求量/延迟 Recharts 图 + 账号池状态）/ 账号池（表格 + 抽屉详情 + 添加/编辑/删除 + 重登）/ Playground（流式对话，参数仅暴露后端真实转发的字段，reasoning 折叠显示）/ 设置（`/admin/api/env` 只读）/ 404
+- **主题**：浅色/深色/跟随系统，`localStorage` 持久化（key `ds2api-theme`），`main.tsx` 挂载前提前 `applyTheme` 防闪烁
+- **轮询**：概览页 stats 5s / accounts 10s / history 30s，账号页 10s（`useApi` hook 带 AbortController + reqId 防竞态）
 
 ### 16.6 与 server.py 集成
 
@@ -2037,9 +2054,11 @@ yield "data: [DONE]\n\n"
 
 ### 18.1 认证相关
 
-- **Token/Cookie 过期**：不定期失效，需重新获取。没有自动续期机制。
-- **多账号**：不支持，启动时从 `.env` 读取单组凭证。
-- **没有 API Key 校验**：`OPENAI_API_KEY` 参数被忽略（接受任意值）。
+- **Token/Cookie 过期**：不定期失效，需重新获取。没有自动续期机制（webui 账号池提供一键重登录）。
+- **账号来源**：`.env` 静态账号（`DEEPSEEK_TOKEN_n`/`DEEPSEEK_COOKIES_n` 或 legacy `DEEPSEEK_TOKEN`）与 webui 面板账号（`data/accounts.json`）双通道，账号池轮询分配。
+- **两套鉴权**：`/v1/*` 客户端用 `API_KEYS`（Bearer 或 `x-api-key`）；webui 管理端用 `DEEPSEEK_ADMIN_PASSWORD` 换 admin 会话 token。
+- **admin token 放行 `/v1/*`**（v2.2.0+ 行为）：`_check_api_auth` 先验证 `verify_admin_token()`，有效则放行——webui 用同一 token 调模型列表/Playground。持有 admin token 者本已能完全控制账号池，不扩大风险面。
+- **登录节流**：每 IP 5 次失败 / 300s 窗口，超限返回 429；计数为进程内存态，重启清零。
 
 ### 18.2 功能限制
 
@@ -2114,13 +2133,11 @@ for /d /r . %d in (__pycache__) do @if exist "%d" rd /s /q "%d"
 - 在 `start.bat` 末尾添加 `__pycache__` 清理命令
 - 修改代码后手动删除 `__pycache__`
 
-### 15.6 缺少 README.md
+### 15.6 README.md
 
-`--pre` 预览版目前没有 `README.md`（开源版有）。维护注意事项：
-- 用户文档应基于开源版的 `README.md` 扩展
-- 需额外说明专家模式配置要求
-- 需注明预览版与开源版的功能差异
-- 如预览版最终合并回开源版，README.md 只需要一份
+`README.md` 已存在并持续同步（v3.0.0 摘要 + start.bat 说明 + API 文档）。维护注意事项：
+- 改 README 时同步更新 "v3.0.0 新增" 摘要与启动说明
+- start.bat 行为（自动 venv/依赖/WebUI 构建/自动开浏览器）在 README 有对应描述，改动脚本时同步
 
 ### 15.7 Windows bash curl 中文编码问题
 
