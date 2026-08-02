@@ -981,6 +981,79 @@ DeepSeek Chat 网页版支持上传文件（如图片、PDF），上传后文件
 - **adapter 层**：`stream=True` 时服务端以 SSE 流返回；`stream=False` 时一次性返回完整响应体
 - **server 层**：streaming 由 `server.py` 的路由选择 `_handle_stream` 还是 `_handle_nonstream`，但内部始终调用 `adapter.chat_stream()`（流式）或 `adapter.chat()`（非流式），不存在 "用非流式 adapter 实现流式 server" 的路径
 
+### 7.13 透传参数全景：客户端 → server → 上游 DeepSeek
+
+> 本节回答一个问题：**客户端发的每个字段，最终以什么形态、什么值打到 `chat.deepseek.com` 上游**。所有信息对应 `adapter.py` 实际代码（请求体构造、`_base_headers`）。
+
+#### 上游三个端点（BASE_URL = `https://chat.deepseek.com`）
+
+| 端点 | 用途 | 请求体 |
+|------|------|--------|
+| `POST /api/v0/chat/create_pow_challenge` | 获取 PoW 挑战 | `{"target_path": "/api/v0/chat/completion"}` |
+| `POST /api/v0/chat_session/create` | 创建会话 | `{"target_path": "/api/v0/chat/completion"}` |
+| `POST /api/v0/chat/completion` | 对话（流式/非流式共用） | 见下 |
+
+#### `/api/v0/chat/completion` 请求体（adapter 实际发送，逐字段）
+
+| 字段 | 值来源 | 说明 |
+|------|--------|------|
+| `chat_session_id` | `create_session()` 返回 | 会话 UUID |
+| `parent_message_id` | adapter `_msg_counters` 或 server 会话缓存 | 首条 `null`；多轮由 server 层 `SESSION_CACHE_TTL` 缓存回传 |
+| `model_type` | server 决策（MODEL_ROUTES/MODE） | `"default"`（快速）\| `"expert"`（专家），**关键开关** |
+| `prompt` | server `_build_prompt()` | 客户端 messages 拼接后的纯文本 |
+| `ref_file_ids` | 固定 `[]` | 不支持文件上传 |
+| `stream` | server 层 `req.stream` | `true`=SSE 流式 / `false`=一次性返回 |
+| `thinking_enabled` | server 决策（THINKING/客户端） | 推理过程开关，**与 `model_type` 独立** |
+| `search_enabled` | server 决策（SEARCH/客户端） | 联网搜索开关 |
+| `preempt` | 固定 `false` | 抢占模式；勿设 `true`（未定义行为） |
+
+#### 请求头（`_base_headers`，模拟真实浏览器）
+
+| 头 | 值 |
+|----|----|
+| `User-Agent` / `Sec-Ch-Ua` / `Sec-Ch-Ua-Mobile` / `Sec-Ch-Ua-Platform` | Chrome 指纹（`DEEPSEEK_IMPERSONATE` 关联 curl_cffi 指纹） |
+| `Accept` / `Accept-Encoding` / `Accept-Language` | 浏览器风格（`gzip, deflate, br, zstd` / `zh-CN,...`） |
+| `Content-Type` | `application/json` |
+| `Authorization` | `Bearer <DEEPSEEK_TOKEN>`（账号凭证） |
+| `Origin` / `Referer` | `https://chat.deepseek.com/` |
+| `Priority` | `u=1, i` |
+| `Sec-Fetch-Dest` / `Sec-Fetch-Mode` / `Sec-Fetch-Site` | `empty` / `cors` / `same-origin` |
+| `X-App-Version` / `X-Client-Version` | `2.0.0`（过低会被上游拒绝专家模式） |
+| `X-Client-Platform` / `X-Client-Locale` / `X-Client-Timezone-Offset` | `web` / `zh_CN` / `28800` |
+| `x-client-bundle-id` | `com.deepseek.chat` |
+| `X-DS-PoW-Response` | **动态**：每次请求前求解，`base64(json PoW token)` |
+
+#### 客户端参数 → 上游字段映射链
+
+**OpenAI `/v1/chat/completions`：**
+
+| 客户端字段 | server 决策（优先级从高到低） | 上游字段 |
+|-----------|------------------------------|---------|
+| `model` | `MODEL_ROUTES` 命中 → 对应 model_type；否则 `MODE=expert` → `"expert"`；否则 `"default"` | `model_type` |
+| `thinking_mode` | `MODEL_ROUTES.thinking` → `THINKING=enabled/disabled` → 客户端 `thinking_mode` | `thinking_enabled` |
+| `search_enabled` | `MODEL_ROUTES.search` → `SEARCH=enabled/disabled` → 客户端 `search_enabled` | `search_enabled` |
+| `stream` | 直接 | `stream` |
+| `temperature` / `top_p` / `max_tokens` | **读取后丢弃**，不参与透传 | — |
+| `tools` / `tool_choice` | server 层转 DSML 注入 `prompt`（见第 8 章） | 不单独成字段 |
+
+**Anthropic `/v1/messages`：**
+
+| 客户端字段 | server 决策 | 上游字段 |
+|-----------|------------|---------|
+| `model` | 同 OpenAI | `model_type` |
+| `thinking.type="enabled"` | 映射为 `thinking_mode` 再走同上链路 | `thinking_enabled` |
+| `metadata.user_id` | 会话缓存键（`SESSION_CACHE_TTL`） | `parent_message_id`（多轮） |
+| `system` / `messages` | `_build_prompt()` 拼接 | `prompt` |
+| `max_tokens` / `stop_sequences` / `temperature` | **忽略** | — |
+
+#### 环境变量优先级总结（最高 → 最低）
+
+```
+MODEL_ROUTES 命中（按 model 名）→ MODE / THINKING / SEARCH env → 客户端字段（thinking_mode / search_enabled）
+```
+
+`MODE`/`THINKING`/`SEARCH` 均为 `auto` 时，`model_type` 恒为 `"default"`、thinking/search 由客户端决定；`MODEL_ROUTES` 只影响匹配到的模型名，未匹配模型回退到 env 逻辑（见 7.12 协作表）。
+
 ---
 
 
