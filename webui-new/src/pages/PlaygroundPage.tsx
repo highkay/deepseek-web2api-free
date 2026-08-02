@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, type CSSProperties } from 'react'
-import { Send, Square, Trash2, FlaskConical } from 'lucide-react'
+import { useState, useRef, useEffect } from 'react'
+import { Send, Square, Trash2, FlaskConical, Info } from 'lucide-react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -20,8 +20,9 @@ import { useToast } from '@/hooks/use-toast'
 import { useAuthStore } from '@/stores/auth'
 import { ApiCallError } from '@/lib/api'
 import { ModelSelector } from '@/components/playground/ModelSelector'
-import { MessageList, type ChatMessage } from '@/components/playground/MessageList'
+import { MessageList, type ChatMessage, type StreamingState } from '@/components/playground/MessageList'
 
+/** Messages sent to the backend (OpenAI-compatible subset we support). */
 interface ApiMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -31,20 +32,27 @@ export default function PlaygroundPage() {
   const token = useAuthStore((s) => s.token)
   const { toast } = useToast()
 
+  // Request parameters — these map to the fields the backend actually
+  // forwards to DeepSeek (see server.py / adapter.py):
+  //   model          -> MODEL_ROUTES may map it to model_type (default/expert)
+  //   thinking_mode  -> DeepSeek thinking_enabled
+  //   search_enabled -> DeepSeek search_enabled
+  // temperature / top_p / max_tokens are ignored by the backend, so they
+  // are intentionally not offered here.
   const [model, setModel] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
-  const [temperature, setTemperature] = useState(0.7)
   const [thinking, setThinking] = useState(false)
   const [search, setSearch] = useState(false)
+
   const [input, setInput] = useState('')
   const [history, setHistory] = useState<ChatMessage[]>([])
-  const [streaming, setStreaming] = useState<string | undefined>(undefined)
+  const [streaming, setStreaming] = useState<StreamingState | null>(null)
   const [busy, setBusy] = useState(false)
   const [clearOpen, setClearOpen] = useState(false)
   const acRef = useRef<AbortController | null>(null)
-  // Tracks the accumulated streamed text so handlers (e.g. stop/abort)
-  // can read the *latest* value instead of the stale render closure.
-  const accRef = useRef('')
+  // Tracks the latest accumulated stream so stop/abort handlers read the
+  // current value instead of a stale render closure.
+  const accRef = useRef<StreamingState>({ reasoning: '', content: '' })
 
   useEffect(() => () => acRef.current?.abort(), [])
 
@@ -55,7 +63,7 @@ export default function PlaygroundPage() {
     setHistory(nextHistory)
     setInput('')
     setBusy(true)
-    setStreaming('')
+    setStreaming({ reasoning: '', content: '' })
 
     const apiMessages: ApiMessage[] = []
     if (systemPrompt.trim()) {
@@ -65,6 +73,8 @@ export default function PlaygroundPage() {
 
     const ac = new AbortController()
     acRef.current = ac
+    const acc: StreamingState = { reasoning: '', content: '' }
+    accRef.current = acc
 
     try {
       const res = await fetch('/v1/chat/completions', {
@@ -76,7 +86,6 @@ export default function PlaygroundPage() {
         body: JSON.stringify({
           model,
           messages: apiMessages,
-          temperature,
           stream: true,
           thinking_mode: thinking,
           search_enabled: search,
@@ -92,10 +101,8 @@ export default function PlaygroundPage() {
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buf = ''
-      let acc = ''
-      accRef.current = ''
 
-      // Parse a single "data: <json>" payload and accumulate its text.
+      // Consume one "data: <json>" payload and accumulate its text.
       const handleEvent = (payload: string) => {
         if (payload === '[DONE]') return
         try {
@@ -103,13 +110,13 @@ export default function PlaygroundPage() {
           const choice = obj.choices?.[0]
           if (!choice) return
           const delta = choice.delta ?? {}
-          if (delta.reasoning_content) {
-            acc += delta.reasoning_content
-          } else if (delta.content) {
-            acc += delta.content
+          if (typeof delta.reasoning_content === 'string') {
+            acc.reasoning += delta.reasoning_content
+          } else if (typeof delta.content === 'string') {
+            acc.content += delta.content
           }
-          accRef.current = acc
-          setStreaming(acc)
+          accRef.current = { reasoning: acc.reasoning, content: acc.content }
+          setStreaming({ reasoning: acc.reasoning, content: acc.content })
         } catch {
           // ignore malformed chunk
         }
@@ -144,14 +151,19 @@ export default function PlaygroundPage() {
         }
       }
 
-      // Finalize: move streaming into history.
-      setHistory([...nextHistory, { role: 'assistant', content: acc }])
-      setStreaming(undefined)
+      setHistory([
+        ...nextHistory,
+        { role: 'assistant', content: acc.content, reasoning: acc.reasoning },
+      ])
+      setStreaming(null)
     } catch (e) {
       if (ac.signal.aborted) {
-        const partial = accRef.current.trim()
-        if (partial) {
-          setHistory([...nextHistory, { role: 'assistant', content: accRef.current }])
+        const cur = accRef.current
+        if (cur.content.trim() || cur.reasoning.trim()) {
+          setHistory([
+            ...nextHistory,
+            { role: 'assistant', content: cur.content, reasoning: cur.reasoning },
+          ])
         } else {
           setHistory(nextHistory)
         }
@@ -159,7 +171,7 @@ export default function PlaygroundPage() {
         const msg = e instanceof ApiCallError ? e.message : String(e)
         toast({ title: '请求失败', description: msg, variant: 'destructive' })
       }
-      setStreaming(undefined)
+      setStreaming(null)
     } finally {
       setBusy(false)
       acRef.current = null
@@ -172,7 +184,7 @@ export default function PlaygroundPage() {
 
   const handleClear = () => {
     setHistory([])
-    setStreaming(undefined)
+    setStreaming(null)
     setClearOpen(false)
   }
 
@@ -194,8 +206,8 @@ export default function PlaygroundPage() {
       />
 
       <div className="grid gap-4 lg:grid-cols-[280px,1fr] flex-1 min-h-0">
-        {/* Left column: parameters */}
-        <Card>
+        {/* Left column: request parameters */}
+        <Card className="overflow-y-auto scrollbar-thin">
           <CardHeader className="pb-2">
             <CardTitle className="text-base flex items-center gap-2">
               <FlaskConical className="h-4 w-4" />
@@ -206,6 +218,10 @@ export default function PlaygroundPage() {
             <div className="space-y-1.5">
               <Label>模型</Label>
               <ModelSelector value={model} onChange={setModel} />
+              <p className="text-[11px] text-muted-foreground">
+                经 <code className="font-mono">MODEL_ROUTES</code> 可映射 DeepSeek
+                <code className="font-mono"> model_type</code>（default / expert）
+              </p>
             </div>
 
             <div className="space-y-1.5">
@@ -220,28 +236,35 @@ export default function PlaygroundPage() {
               />
             </div>
 
-            <div className="space-y-1.5">
-              <Label htmlFor="temp">温度: {temperature.toFixed(1)}</Label>
-              <input
-                id="temp"
-                type="range"
-                min="0"
-                max="2"
-                step="0.1"
-                value={temperature}
-                onChange={(e) => setTemperature(parseFloat(e.target.value))}
-                className="w-full"
-                style={{ '--range-fill': `${(temperature / 2) * 100}%` } as CSSProperties}
-              />
+            <div className="flex items-center justify-between">
+              <div>
+                <Label htmlFor="thinking">思考模式</Label>
+                <p className="text-[11px] text-muted-foreground">
+                  对应 DeepSeek <code className="font-mono">thinking_enabled</code>
+                </p>
+              </div>
+              <Switch id="thinking" checked={thinking} onCheckedChange={setThinking} />
             </div>
 
             <div className="flex items-center justify-between">
-              <Label htmlFor="thinking">专家模式</Label>
-              <Switch id="thinking" checked={thinking} onCheckedChange={setThinking} />
-            </div>
-            <div className="flex items-center justify-between">
-              <Label htmlFor="search">联网搜索</Label>
+              <div>
+                <Label htmlFor="search">联网搜索</Label>
+                <p className="text-[11px] text-muted-foreground">
+                  对应 DeepSeek <code className="font-mono">search_enabled</code>
+                </p>
+              </div>
               <Switch id="search" checked={search} onCheckedChange={setSearch} />
+            </div>
+
+            <div className="rounded-md border border-dashed p-3 text-[11px] leading-relaxed text-muted-foreground space-y-1">
+              <p className="flex items-center gap-1 font-medium text-foreground/80">
+                <Info className="h-3.5 w-3.5" />
+                参数生效规则
+              </p>
+              <p>· 服务端 .env 的 MODE / THINKING / SEARCH 优先级高于此处设置</p>
+              <p>· MODE=expert 时始终走专家模式（model_type=expert）</p>
+              <p>· THINKING/SEARCH 为 enabled/disabled 时强制开关</p>
+              <p>· temperature / top_p / max_tokens 后端暂不生效，未提供</p>
             </div>
           </CardContent>
         </Card>
