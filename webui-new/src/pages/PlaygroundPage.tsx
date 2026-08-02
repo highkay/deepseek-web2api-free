@@ -28,6 +28,12 @@ interface ApiMessage {
   content: string
 }
 
+/** Display labels for the model dropdown — mark the quick/expert modes. */
+const MODEL_LABELS: Record<string, string> = {
+  'deepseek-chat': 'deepseek-chat（快速 / 默认）',
+  'deepseek-reasoner': 'deepseek-reasoner（专家）',
+}
+
 export default function PlaygroundPage() {
   const token = useAuthStore((s) => s.token)
   const { toast } = useToast()
@@ -217,9 +223,9 @@ export default function PlaygroundPage() {
           <CardContent className="space-y-4">
             <div className="space-y-1.5">
               <Label>模型</Label>
-              <ModelSelector value={model} onChange={setModel} />
+              <ModelSelector value={model} onChange={setModel} labels={MODEL_LABELS} />
               <p className="text-[11px] text-muted-foreground">
-                经 <code className="font-mono">MODEL_ROUTES</code> 可映射 DeepSeek
+                经 <code className="font-mono">MODEL_ROUTES</code> 映射 DeepSeek
                 <code className="font-mono"> model_type</code>（default / expert）
               </p>
             </div>

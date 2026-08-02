@@ -7,9 +7,11 @@ import type { ModelsResponse } from '@/lib/types'
 interface Props {
   value: string
   onChange: (v: string) => void
+  /** Optional display-label map (e.g. mark quick/expert modes). */
+  labels?: Record<string, string>
 }
 
-export function ModelSelector({ value, onChange }: Props) {
+export function ModelSelector({ value, onChange, labels }: Props) {
   const { data, error } = useApi<ModelsResponse>('/v1/models')
   const [firstRender, setFirstRender] = useState(true)
 
@@ -40,7 +42,7 @@ export function ModelSelector({ value, onChange }: Props) {
       <SelectContent>
         {models.map((m) => (
           <SelectItem key={m.id} value={m.id}>
-            {m.id}
+            {labels?.[m.id] ?? m.id}
           </SelectItem>
         ))}
       </SelectContent>
