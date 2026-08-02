@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from adapter import DeepSeekAdapter
+from adapter import DeepSeekAdapter, UpstreamEmptyError
 from admin import (
     router as admin_router,
     get_pool,
@@ -775,6 +775,10 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         completion_tokens = count_text(content) + count_text(thinking)
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
                            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    except UpstreamEmptyError as e:
+        get_stats().record(MODEL_NAME, 0, success=False)
+        pool.mark_error(acq.acct, str(e))
+        raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))

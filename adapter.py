@@ -63,6 +63,13 @@ class WAFChallengeError(Exception):
         self.body = body
 
 
+class UpstreamEmptyError(RuntimeError):
+    """Raised when the upstream returned a 200 with an empty body (no SSE
+    data lines at all). This is typically a transient throttle/WAF state;
+    the adapter retries once with a fresh session before giving up.
+    """
+
+
 class _WASMSolver:
     """WASM-based PoW solver (reused across calls) — thread-safe via lock."""
 
@@ -185,9 +192,10 @@ class DeepSeekAdapter:
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
-            # DeepSeek-specific application headers (current as of 2026-06-19).
-            "X-App-Version": "2.0.0",
-            "X-Client-Version": "2.0.0",
+            # DeepSeek-specific application headers (current as of 2026-08-02).
+            # x-client-version tracks the browser release; X-App-Version is no
+            # longer sent by the real frontend and was dropped.
+            "X-Client-Version": "2.3.0",
             "X-Client-Platform": "web",
             "X-Client-Locale": "zh_CN",
             "X-Client-Timezone-Offset": "28800",
@@ -393,11 +401,29 @@ class DeepSeekAdapter:
         only care about the visible text should unpack with
         ``content, _ = adapter.chat(...)``.
         """
+        for attempt in (1, 2):
+            try:
+                return self._chat_once(session_id, prompt, model_type=model_type,
+                                       thinking_enabled=thinking_enabled,
+                                       search_enabled=search_enabled,
+                                       parent_message_id=parent_message_id)
+            except UpstreamEmptyError:
+                if attempt == 2:
+                    raise
+                log.warning("upstream_empty_retry_nonstream")
+                session_id = self.create_session()
+        raise UpstreamEmptyError("upstream returned empty response")  # pragma: no cover
+
+    def _chat_once(self, session_id: str, prompt: str, model_type: str | None = None,
+                   thinking_enabled: bool = False, search_enabled: bool = False,
+                   parent_message_id: int | None = None) -> tuple[str, str]:
         resp = self._send_completion(session_id, prompt, stream=False,
-                                      model_type=model_type,
-                                      thinking_enabled=thinking_enabled,
-                                      search_enabled=search_enabled,
-                                      parent_message_id=parent_message_id)
+                                     model_type=model_type,
+                                     thinking_enabled=thinking_enabled,
+                                     search_enabled=search_enabled,
+                                     parent_message_id=parent_message_id)
+        if not resp.text or not resp.text.strip():
+            raise UpstreamEmptyError("upstream returned empty response body")
         events = self._parse_sse(resp.text)
 
         # Issue #8: upstream may reject with a `toast` event of type=error
@@ -484,7 +510,37 @@ class DeepSeekAdapter:
 
         ``parent_message_id`` is the message id from the previous turn; pass
         ``None`` to start a fresh thread.
+
+        A completely empty upstream stream (no tokens at all) is retried
+        once with a fresh session; if it is still empty an
+        ``UpstreamEmptyError`` is raised.
         """
+        for attempt in (1, 2):
+            yielded = False
+            try:
+                for token in self._chat_stream_once(
+                        session_id, prompt, model_type=model_type,
+                        thinking_enabled=thinking_enabled,
+                        search_enabled=search_enabled,
+                        parent_message_id=parent_message_id):
+                    yielded = True
+                    yield token
+            except UpstreamEmptyError:
+                if attempt == 2:
+                    raise
+            else:
+                if yielded:
+                    return
+                log.warning("upstream_empty_retry_stream")
+            if attempt == 2:
+                break
+            session_id = self.create_session()
+        raise UpstreamEmptyError("upstream returned empty response")  # pragma: no cover
+
+    def _chat_stream_once(self, session_id: str, prompt: str,
+                          model_type: str | None = None,
+                          thinking_enabled: bool = False, search_enabled: bool = False,
+                          parent_message_id: int | None = None):
         headers = self._pow_headers("/api/v0/chat/completion")
         if parent_message_id is None:
             mid = self._msg_counters.get(session_id, 0) + 1
