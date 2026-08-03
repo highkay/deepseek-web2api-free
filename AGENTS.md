@@ -4,15 +4,24 @@
 
 ---
 
-## v3.0.0 → v3.2.0 变更摘要
+## v3.0.0 → v3.2.1 变更摘要
 
-### v3.2.0（2026-08）：维护版本
+### v3.2.1（2026-08-03）：空响应根因修复
 
-- **start.bat 重构**（详见 README）：自动 venv/依赖/WebUI 构建/自动开浏览器/安全端口处理（PowerShell 替代 wmic）
-- **WebUI**：静态资源 404 修复（base+basename）、7 处 bug 修复与美化、Playground 重写、快速/专家模型模式
-- **鉴权**：`/v1/*` 接受 admin token；**账号池**：env 凭证池空兜底
-- **上游空响应加固**：`UpstreamEmptyError` + 重试 + 502/错误帧
-- **适配器**：X-Client-Version 2.3.0、删 X-App-Version、hif 头机制记录
+- **根因**：请求过频时上游返回 HTTP 200 + SSE `event: hint`（`type=error`，`finish_reason=rate_limit_reached`，"消息发送过于频繁，请稍后重试"）且**无任何 content token**；adapter 原先不解析 `hint` 事件 → 限流被当成"空内容"返回
+- **修复**：新增 `RateLimitError`/`UpstreamHintError`，非流式 `_scan_hint_errors()` + 流式内联检测 hint（与 toast 同构）；`server` 映射 **429**（限流）/ 502（其他 hint 错误）
+- 完整清单：`docs/release-notes/v3.2.1.md`
+
+### v3.2.0（2026-08-02）：维护版本
+
+- **start.bat 重构**：自动定位 Python 3.10+、检测/创建虚拟环境（`.venv`/`venv`/`env`）、`pip install --dry-run` 校验依赖并自动安装、WebUI dist 缺失时自动 `npm` 构建（`WEBUI_REBUILD=1` 强制重建）、启动前打印访问地址并默认 3s 后自动打开浏览器（`WEBUI_OPEN=0` 跳过）、端口占用只杀本项目进程（PowerShell `Get-CimInstance` 读命令行替代已废弃的 `wmic`；GBK+CRLF 编码）
+- **WebUI**：静态资源 404 修复（vite `base: '/webui/'` + router `basename: '/webui'`）、7 处 bug 修复与界面美化、Playground 重写（参数对应后端真实转发字段、移除无效温度滑块、`reasoning_content` 可视化）、快速/专家两种模型模式（`MODEL_ROUTES` 默认启用）
+- **鉴权**：`/v1/*` 接受有效 admin 会话 token（`verify_admin_token`）
+- **账号池**：env 凭证改为**池空只读兜底**（`_env_fallback`，面板账号优先；不再预加载进池）
+- **上游空响应加固**：`UpstreamEmptyError` + 换新会话重试 1 次 + 502/错误帧
+- **适配器**：`X-Client-Version` 2.0.0 → 2.3.0、删除过时的 `X-App-Version`（HAR 比对确认浏览器不再发送）
+- **hif 签名头**（逆向记录）：浏览器发 `x-hif-leim`/`x-hif-dliq`（值来自 `hif-leim/hif-dliq.deepseek.com/query`，TTL 600s，localStorage 缓存）；adapter 当前未发送（实测不加也可用），若未来上游强制校验需实现拉取
+- **已知环境事实**：`wmic` 已在 Win11 24H2+ 移除；`timeout` 命令与 Git Bash GNU coreutils 冲突（脚本用 `ping -n 2` 延时）
 - 完整清单：`docs/release-notes/v3.2.0.md`
 
 ### v3.0.0（2026-06）：React WebUI 重写
@@ -21,17 +30,6 @@
 - 新增 `stats_history.py`（30s 快照滚动窗口）、`GET /admin/api/history`、`GET /admin/api/env`
 - WebUI 产物位于 `webui-new/dist/`，由 `server.py` 在 `/webui/*` 下伺服；旧 `webui/` 已删除
 - **构建要求**：vite `base: '/webui/'` + react-router `basename: '/webui'`，两者缺失会导致资源 404 白屏
-
-### 2026-08 维护（start.bat / 鉴权 / Playground）
-
-- **start.bat 重构**：自动定位 Python 3.10+、检测/创建虚拟环境（`.venv`/`venv`/`env`）、`pip install --dry-run` 校验依赖并自动安装、WebUI dist 缺失时自动 `npm` 构建（`WEBUI_REBUILD=1` 强制重建）、启动前打印访问地址并默认 3s 后自动打开浏览器（`WEBUI_OPEN=0` 跳过）、端口占用只杀本项目进程（用 PowerShell `Get-CimInstance` 读命令行替代已废弃的 `wmic`）
-- **鉴权**：`/v1/*` 的 `_check_api_auth` 现在也接受有效 admin 会话 token（`verify_admin_token`），webui 用同一 token 调模型列表与 Playground
-- **Playground 重写**：参数只保留后端真实转发的字段（`model` ↔ `model_type`、`thinking_mode` ↔ `thinking_enabled`、`search_enabled`）；temperature/top_p/max_tokens 后端忽略故不再提供；流式 `reasoning_content` 可视化（"推理过程"折叠块）
-- **上游空响应加固**（2026-08-02）：上游偶发返回 HTTP 200 + 空 SSE body（疑似临时限流/WAF 状态），此前会以"200 + 空内容"静默返回给客户端。`adapter` 新增 `UpstreamEmptyError`，`chat()`/`chat_stream()` 空响应自动换新会话重试 1 次，仍空则 `server` 非流式返回 502 明确报错（流式发错误帧）
-- **空响应根因确认**（2026-08-03）：排查定位——"空响应"绝大多数是**上游限流**：请求过频时 chat.deepseek.com 返回 200 + SSE `event: hint`（`type=error`，`finish_reason=rate_limit_reached`，内容"消息发送过于频繁，请稍后重试"）且**无任何 content token**。adapter 原先不解析 `hint` 事件 → 限流被当成空内容返回。新增 `RateLimitError`/`UpstreamHintError` 解析 hint（非流式 `_scan_hint_errors` + 流式内联检测），`server` 映射为 **429**（限流）/ 502（其他 hint 错误）
-- **hif 签名头**（2026-08-02 逆向发现）：真实浏览器会发 `x-hif-leim`/`x-hif-dliq`（可选 `x-hif-ttl`），值来自 GET `https://hif-leim.deepseek.com/query` 与 `https://hif-dliq.deepseek.com/query`（响应 `data.biz_data.value`，TTL 在 `x-hif-ttl` 头默认 600s，浏览器缓存于 localStorage `hif_leim_cached`/`hif_dliq_cached`）。当前 adapter 未发送这两个头（实测不加也可用），若未来上游强制校验需实现拉取
-- **X-Client-Version 对齐**：`2.0.0` → `2.3.0`；删除过时的 `X-App-Version` 头（真实浏览器已不再发送，经 HAR 比对确认）
-- **已知环境事实**：`wmic` 已在 Win11 24H2+ 移除；`timeout` 命令与 Git Bash 的 GNU coreutils 冲突（脚本用 `ping -n 2` 延时）
 
 ---
 
@@ -397,7 +395,7 @@ def create_session(self) -> str:
     #   V20241129.1: biz_data.chat_session.id
 ```
 
-**响应格式兼容性：**
+**响应格式兼容性**（历史观察：早期 `X-App-Version` 不同值时 create_session 返回两种格式；当前适配器 `create_session()` 对两种格式均兼容，见 5.2）：
 
 旧版本头 (`X-App-Version: 0.0.1`)：
 ```json
@@ -812,27 +810,28 @@ data: {"p":"response/status","o":"SET","v":"FINISHED"}
 | SSE 内容格式 | 同上（均可能用 fragments） | 同上（均可能用 fragments） |
 | Fragment 系统 | 可选（模型自主决定） | 一定有 THINK → RESPONSE |
 | `reasoning_content` | 取决于 THINKING | 取决于 THINKING |
-| 请求头要求 | 宽松 | 需 `X-App-Version: 20241129.1` 等 |
+| 请求头要求 | 宽松 | 需 `X-Client-Version: 2.3.0` 等（见 7.7） |
 
 实际上 DeepSeek 的快速模式和专家模式在 SSE 协议层差异极小，`model_type` 主要影响模型的选择与其推理深度。
 
-### 7.7 请求头要求
+### 7.7 请求头要求（2026-08 现状）
 
-专家模式对请求头有更严格的要求。从 HAR 抓包确认的必要头：
+从 HAR 抓包（2026-08-02，浏览器 Chrome 150）确认的当前请求头：
 
 ```
-X-App-Version: 20241129.1        ← 必须使用确切版本号（旧版 0.0.1 被拒）
-X-Client-Version: 2.0.0
+X-Client-Version: 2.3.0          ← 当前浏览器版本（旧 2.0.0 时代已过）
 X-Client-Platform: web
 X-Client-Locale: zh_CN
 X-Client-Timezone-Offset: 28800
+x-client-bundle-id: com.deepseek.chat
+X-Hif-Leim / X-Hif-Dliq          ← 新增签名头（见 7.13；adapter 暂未发送，实测可不加）
 ```
 
-`X-App-Version: 0.0.1` 会导致服务端返回错误 `"Update to the latest version to use Expert."`。
+**`X-App-Version` 已废弃**：2026-08 真实浏览器不再发送该头（旧版本 `20241129.1`/`2.0.0` 时代已过）。adapter 自 v3.2.0 起已删除该头。
 
-其他浏览器自动发送的 `sec-ch-ua`、`sec-fetch-*` 头未被严格校验。
+> 历史：v2.x 时代 `X-App-Version: 0.0.1` 会导致服务端返回 `"Update to the latest version to use Expert."`（toast 事件，v3.2.0 已解析透出）。当前上游的"版本过旧"判断主要基于 `X-Client-Version`。
 
-注意：快速模式对这些请求头的要求也相对宽松，但未来可能会收紧。
+其他浏览器自动发送的 `sec-ch-ua`、`sec-fetch-*` 头未被严格校验（但 TLS/JA3 指纹疑似被检测——自动化指纹（curl_cffi/tls-client）在高频时会被上游限流，见 v3.2.1 摘要）。
 
 ### 7.8 状态机（`chat_stream` 中的 `frag_type`）
 
@@ -2160,7 +2159,7 @@ yield "data: [DONE]\n\n"
 | `max_tokens` 无效 | DeepSeek API 不支持 | 超长回复需自行截断 |
 | `temperature`/`top_p` 无效 | DeepSeek API 不支持 | 无法控制随机性 |
 | 无多模态 | 网页 API 不支持图片 | 仅文本交互 |
-| THINK 内容在非流式模式不返回 | 当前实现仅收集 RESPONSE fragment | 非流式看不到推理过程 |
+| 非流式 OpenAI 端点不输出 reasoning_content | OpenAI 非流式响应模型未包含该字段 | 需要推理过程请用流式模式（Anthropic 非流式已支持 thinking 块） |
 
 ### 18.3 CORS 跨域支持
 
@@ -2226,8 +2225,8 @@ for /d /r . %d in (__pycache__) do @if exist "%d" rd /s /q "%d"
 
 ### 15.6 README.md
 
-`README.md` 已存在并持续同步（v3.0.0 摘要 + start.bat 说明 + API 文档）。维护注意事项：
-- 改 README 时同步更新 "v3.0.0 新增" 摘要与启动说明
+`README.md` 已存在并持续同步（v3.2.1 摘要 + 快速开始 + API 文档）。维护注意事项：
+- 改 README 时同步更新 "v3.2.1 修复" 摘要与快速开始（启动/配置/凭证语义）
 - start.bat 行为（自动 venv/依赖/WebUI 构建/自动开浏览器）在 README 有对应描述，改动脚本时同步
 
 ### 15.7 Windows bash curl 中文编码问题
