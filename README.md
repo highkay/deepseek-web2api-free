@@ -8,7 +8,7 @@
 
 ---
 
-## v3.2.2 新增（开发中）
+## v3.2.2 新增
 
 - **上游限流自适应**：触发上游限流（429）时自动退避重试（`DEEPSEEK_RATE_LIMIT_RETRY_DELAYS` 默认 `5,15`，每次换新会话）；`DEEPSEEK_JITTER_SECS` 默认值改为 `0.4`，降低触发限流概率
 - **hif 签名头**：自动拉取 `hif-leim/hif-dliq.deepseek.com/query` 并发送 `x-hif-leim`/`x-hif-dliq`（TTL 缓存 600s；拉取失败静默降级，不影响请求）

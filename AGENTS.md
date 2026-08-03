@@ -12,7 +12,7 @@
 - **修复**：新增 `RateLimitError`/`UpstreamHintError`，非流式 `_scan_hint_errors()` + 流式内联检测 hint（与 toast 同构）；`server` 映射 **429**（限流）/ 502（其他 hint 错误）
 - 完整清单：`docs/release-notes/v3.2.1.md`
 
-### v3.2.2（开发中）：限流自适应 + hif 发送 + 测试覆盖
+### v3.2.2（2026-08-03）：限流自适应 + hif 发送 + 测试覆盖 + 会话缓存修复
 
 - **上游限流自适应**：`RateLimitError` 退避重试（`DEEPSEEK_RATE_LIMIT_RETRY_DELAYS` 默认 `5,15`，每次退避后换新会话）；`DEEPSEEK_JITTER_SECS` 默认 `0.4`（降低触发限流概率）
 - **hif 签名头发送**：`_HifProvider` 拉取 `hif-leim/hif-dliq.deepseek.com/query`（`data.biz_data.value`，`x-hif-ttl` 缓存默认 600s），completion 请求附加 `X-Hif-Leim/Dliq`（create_session 不带）；失败静默降级（不加头）
