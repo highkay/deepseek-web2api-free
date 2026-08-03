@@ -67,6 +67,8 @@ jobs:
                           tests/test_model_router.py \
                           tests/test_rate_limiter.py \
                           tests/test_ip_utils.py \
+                          tests/test_adapter.py \
+                          tests/test_account_pool.py \
                           -v --tb=short
 
   e2e:

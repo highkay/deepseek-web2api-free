@@ -12,6 +12,13 @@
 - **修复**：新增 `RateLimitError`/`UpstreamHintError`，非流式 `_scan_hint_errors()` + 流式内联检测 hint（与 toast 同构）；`server` 映射 **429**（限流）/ 502（其他 hint 错误）
 - 完整清单：`docs/release-notes/v3.2.1.md`
 
+### v3.2.2（开发中）：限流自适应 + hif 发送 + 测试覆盖
+
+- **上游限流自适应**：`RateLimitError` 退避重试（`DEEPSEEK_RATE_LIMIT_RETRY_DELAYS` 默认 `5,15`，每次退避后换新会话）；`DEEPSEEK_JITTER_SECS` 默认 `0.4`（降低触发限流概率）
+- **hif 签名头发送**：`_HifProvider` 拉取 `hif-leim/hif-dliq.deepseek.com/query`（`data.biz_data.value`，`x-hif-ttl` 缓存默认 600s），completion 请求附加 `X-Hif-Leim/Dliq`（create_session 不带）；失败静默降级（不加头）
+- **测试覆盖**：`tests/test_adapter.py`（15 用例，hint/toast/空响应重试/退避/hif）+ `tests/test_account_pool.py`（10 用例，env 兜底/池空/只读保护/持久化），全套 81 测试
+- 流式 toast/hint 检测修复：上游错误 data 为顶层 dict（非 `v` 包装），两者均检查
+
 ### v3.2.0（2026-08-02）：维护版本
 
 - **start.bat 重构**：自动定位 Python 3.10+、检测/创建虚拟环境（`.venv`/`venv`/`env`）、`pip install --dry-run` 校验依赖并自动安装、WebUI dist 缺失时自动 `npm` 构建（`WEBUI_REBUILD=1` 强制重建）、启动前打印访问地址并默认 3s 后自动打开浏览器（`WEBUI_OPEN=0` 跳过）、端口占用只杀本项目进程（PowerShell `Get-CimInstance` 读命令行替代已废弃的 `wmic`；GBK+CRLF 编码）
@@ -20,7 +27,7 @@
 - **账号池**：env 凭证改为**池空只读兜底**（`_env_fallback`，面板账号优先；不再预加载进池）
 - **上游空响应加固**：`UpstreamEmptyError` + 换新会话重试 1 次 + 502/错误帧
 - **适配器**：`X-Client-Version` 2.0.0 → 2.3.0、删除过时的 `X-App-Version`（HAR 比对确认浏览器不再发送）
-- **hif 签名头**（逆向记录）：浏览器发 `x-hif-leim`/`x-hif-dliq`（值来自 `hif-leim/hif-dliq.deepseek.com/query`，TTL 600s，localStorage 缓存）；adapter 当前未发送（实测不加也可用），若未来上游强制校验需实现拉取
+- **hif 签名头**（逆向记录）：浏览器发 `x-hif-leim`/`x-hif-dliq`（值来自 `hif-leim/hif-dliq.deepseek.com/query`，TTL 600s，localStorage 缓存）；v3.2.2 起 adapter 通过 `_HifProvider` 自动拉取并发送（失败静默降级，见 7.13）
 - **已知环境事实**：`wmic` 已在 Win11 24H2+ 移除；`timeout` 命令与 Git Bash GNU coreutils 冲突（脚本用 `ping -n 2` 延时）
 - 完整清单：`docs/release-notes/v3.2.0.md`
 
@@ -824,7 +831,7 @@ X-Client-Platform: web
 X-Client-Locale: zh_CN
 X-Client-Timezone-Offset: 28800
 x-client-bundle-id: com.deepseek.chat
-X-Hif-Leim / X-Hif-Dliq          ← 新增签名头（见 7.13；adapter 暂未发送，实测可不加）
+X-Hif-Leim / X-Hif-Dliq          ← 签名头（v3.2.2 起 adapter 通过 _HifProvider 自动发送，见 7.13）
 ```
 
 **`X-App-Version` 已废弃**：2026-08 真实浏览器不再发送该头（旧版本 `20241129.1`/`2.0.0` 时代已过）。adapter 自 v3.2.0 起已删除该头。
@@ -1698,6 +1705,10 @@ class ContentPart(BaseModel):
 | `MODE` | `auto` | 模式控制：`auto`/`quick`/`expert` |
 | `THINKING` | `auto` | 思考控制：`auto`/`enabled`/`disabled` |
 | `SEARCH` | `auto` | 联网搜索控制：`auto`/`enabled`/`disabled` |
+| `DEEPSEEK_JITTER_SECS` | `0.4`（v3.2.2+） | 上游调用前随机 sleep（0~N 秒），降低触发上游限流概率；`0` 禁用 |
+| `DEEPSEEK_RATE_LIMIT_RETRY_DELAYS` | `5,15`（v3.2.2+） | 上游限流（`rate_limit_reached`）时的退避秒数列表，每项重试一次并换新会话；空则禁重试 |
+
+> 其余可选变量（`API_KEYS`、`HOST`、限流、加密、日志、`MODEL_ROUTES`、`SESSION_CACHE_TTL`、`DEEPSEEK_IMPERSONATE` 等）见 `.env.example` 注释。
 
 #### MODE 详细说明
 

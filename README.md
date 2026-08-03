@@ -8,6 +8,15 @@
 
 ---
 
+## v3.2.2 新增（开发中）
+
+- **上游限流自适应**：触发上游限流（429）时自动退避重试（`DEEPSEEK_RATE_LIMIT_RETRY_DELAYS` 默认 `5,15`，每次换新会话）；`DEEPSEEK_JITTER_SECS` 默认值改为 `0.4`，降低触发限流概率
+- **hif 签名头**：自动拉取 `hif-leim/hif-dliq.deepseek.com/query` 并发送 `x-hif-leim`/`x-hif-dliq`（TTL 缓存 600s；拉取失败静默降级，不影响请求）
+- **测试覆盖**：新增 `tests/test_adapter.py`（15 用例）与 `tests/test_account_pool.py`（10 用例），全套 81 个测试
+- 修复流式 toast/hint 错误检测（上游错误 data 为顶层 JSON 而非 `v` 包装）
+
+---
+
 ## v3.2.1 修复
 
 2026-08-03 补丁版本——**定位并修复流式/非流式空响应的根因**：

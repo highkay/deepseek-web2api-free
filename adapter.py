@@ -37,9 +37,18 @@ BASE_URL = "https://chat.deepseek.com"
 TOKEN = os.environ.get("DEEPSEEK_TOKEN", "")
 IMPERSONATE = os.environ.get("DEEPSEEK_IMPERSONATE", "chrome131")
 try:
-    JITTER_SECS = max(0.0, float(os.environ.get("DEEPSEEK_JITTER_SECS", "0") or 0))
+    JITTER_SECS = max(0.0, float(os.environ.get("DEEPSEEK_JITTER_SECS", "0.4") or 0))
 except ValueError:
     JITTER_SECS = 0.0
+
+# Backoff delays (seconds) before retrying after an upstream rate limit
+# (RateLimitError). Each entry consumes one retry; after the last entry
+# the error is surfaced to the caller. Disable by setting to empty.
+try:
+    _raw_delays = os.environ.get("DEEPSEEK_RATE_LIMIT_RETRY_DELAYS", "5,15")
+    RATE_LIMIT_RETRY_DELAYS = [float(x) for x in _raw_delays.split(",") if x.strip()]
+except ValueError:
+    RATE_LIMIT_RETRY_DELAYS = []
 
 _WASM_PATH = Path(__file__).resolve().parent / "sha3_wasm_bg.wasm"
 with open(_WASM_PATH, "rb") as f:
@@ -80,6 +89,75 @@ class UpstreamHintError(RuntimeError):
 class RateLimitError(UpstreamHintError):
     """Upstream rate limiting (finish_reason ``rate_limit_reached``:
     '消息发送过于频繁，请稍后重试'). Maps to HTTP 429 on the server side."""
+
+
+# Upstream hif signature headers: the browser fetches these from dedicated
+# endpoints and attaches them to chat/completion requests. Values are
+# cached for the TTL announced via the x-hif-ttl response header (600s).
+HIF_LEIM_URL = "https://hif-leim.deepseek.com/query"
+HIF_DLIQ_URL = "https://hif-dliq.deepseek.com/query"
+
+
+class _HifProvider:
+    """Best-effort fetcher/cache for the ``x-hif-leim`` / ``x-hif-dliq``
+    signature headers.
+
+    Any failure (network, non-200, bad payload) degrades to no hif headers
+    — the upstream currently accepts requests without them, so the main
+    request must never fail because of hif. A stale cached value is reused
+    if a refresh fails (better than dropping the header mid-session).
+    """
+
+    def __init__(self, client=None):
+        self._client = client
+        self._cache: dict[str, tuple[str, float]] = {}
+        self._lock = threading.Lock()
+
+    def _fetch(self, url: str) -> tuple[str, float] | None:
+        if self._client is None:
+            return None
+        try:
+            resp = self._client.get(url, timeout=10)
+            if resp.status_code != 200:
+                return None
+            try:
+                ttl = float(resp.headers.get("x-hif-ttl", "600") or 600)
+            except (TypeError, ValueError):
+                ttl = 600.0
+            value = resp.json().get("data", {}).get("biz_data", {}).get("value")
+            if not value:
+                return None
+            return str(value), max(ttl, 1.0)
+        except Exception as e:
+            log.warning("hif_fetch_failed", extra={"url": url, "error": str(e)[:120]})
+            return None
+
+    def _get(self, key: str, url: str) -> str | None:
+        now = time.time()
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None and hit[1] > now:
+                return hit[0]
+        fetched = self._fetch(url)
+        if fetched is None:
+            with self._lock:
+                hit = self._cache.get(key)
+                return hit[0] if hit else None
+        value, ttl = fetched
+        with self._lock:
+            self._cache[key] = (value, now + ttl)
+        return value
+
+    def headers(self) -> dict:
+        """Return ``{x-hif-leim: ..., x-hif-dliq: ...}`` or ``{}`` on failure."""
+        out = {}
+        leim = self._get("leim", HIF_LEIM_URL)
+        if leim:
+            out["X-Hif-Leim"] = leim
+        dliq = self._get("dliq", HIF_DLIQ_URL)
+        if dliq:
+            out["X-Hif-Dliq"] = dliq
+        return out
 
 
 class _WASMSolver:
@@ -167,6 +245,9 @@ class DeepSeekAdapter:
             timeout=120,
             proxies={"all": proxy} if proxy else None,
         )
+        # Best-effort hif signature headers (see _HifProvider); never
+        # fails the main request.
+        self._hif = _HifProvider(client=self._client)
         # Seed jar from the user-supplied cookie blob (one-shot import only;
         # afterwards the jar is the source of truth).
         if cookies:
@@ -293,16 +374,20 @@ class DeepSeekAdapter:
         }, separators=(",", ":"))
         return base64.b64encode(raw.encode()).decode()
 
-    def _pow_headers(self, target_path: str = "/api/v0/chat/completion"):
+    def _pow_headers(self, target_path: str = "/api/v0/chat/completion",
+                     include_hif: bool = True):
         if JITTER_SECS > 0:
             time.sleep(random.uniform(0, JITTER_SECS))
         c = self._get_challenge(target_path)
         pow_h = self._solve(c)
-        return {**self._base_headers, "X-DS-PoW-Response": pow_h}
+        headers = {**self._base_headers, "X-DS-PoW-Response": pow_h}
+        if include_hif:
+            headers.update(self._hif.headers())
+        return headers
 
     def create_session(self) -> str:
         """Create a new chat session, returns session_id"""
-        headers = self._pow_headers("/api/v0/chat/completion")
+        headers = self._pow_headers("/api/v0/chat/completion", include_hif=False)
         resp = self._client.post(
             f"{BASE_URL}/api/v0/chat_session/create",
             json={"target_path": "/api/v0/chat/completion"},
@@ -441,14 +526,23 @@ class DeepSeekAdapter:
         only care about the visible text should unpack with
         ``content, _ = adapter.chat(...)``.
         """
-        for attempt in (1, 2):
+        for attempt in range(1, max(len(RATE_LIMIT_RETRY_DELAYS), 1) + 2):
             try:
                 return self._chat_once(session_id, prompt, model_type=model_type,
                                        thinking_enabled=thinking_enabled,
                                        search_enabled=search_enabled,
                                        parent_message_id=parent_message_id)
+            except RateLimitError:
+                idx = attempt - 1
+                if idx >= len(RATE_LIMIT_RETRY_DELAYS):
+                    raise
+                delay = RATE_LIMIT_RETRY_DELAYS[idx]
+                log.warning("upstream_rate_limit_retry_nonstream",
+                            extra={"attempt": attempt, "delay": delay})
+                time.sleep(delay)
+                session_id = self.create_session()
             except UpstreamEmptyError:
-                if attempt == 2:
+                if attempt > 1:
                     raise
                 log.warning("upstream_empty_retry_nonstream")
                 session_id = self.create_session()
@@ -562,7 +656,7 @@ class DeepSeekAdapter:
         once with a fresh session; if it is still empty an
         ``UpstreamEmptyError`` is raised.
         """
-        for attempt in (1, 2):
+        for attempt in range(1, max(len(RATE_LIMIT_RETRY_DELAYS), 1) + 2):
             yielded = False
             try:
                 for token in self._chat_stream_once(
@@ -572,14 +666,22 @@ class DeepSeekAdapter:
                         parent_message_id=parent_message_id):
                     yielded = True
                     yield token
+            except RateLimitError:
+                idx = attempt - 1
+                if idx >= len(RATE_LIMIT_RETRY_DELAYS):
+                    raise
+                delay = RATE_LIMIT_RETRY_DELAYS[idx]
+                log.warning("upstream_rate_limit_retry_stream",
+                            extra={"attempt": attempt, "delay": delay})
+                time.sleep(delay)
             except UpstreamEmptyError:
-                if attempt == 2:
+                if attempt > 1:
                     raise
             else:
                 if yielded:
                     return
                 log.warning("upstream_empty_retry_stream")
-            if attempt == 2:
+            if attempt > max(len(RATE_LIMIT_RETRY_DELAYS), 1):
                 break
             session_id = self.create_session()
         raise UpstreamEmptyError("upstream returned empty response")  # pragma: no cover
@@ -659,17 +761,23 @@ class DeepSeekAdapter:
                 # payload both arrive as separate SSE frames, so we have
                 # to check both — sometimes the server only sends the
                 # data frame with the toast field inline.
-                if current_event == "toast" and isinstance(v, dict) and \
-                        str(v.get("type", "")).lower() == "error":
+                # Upstream error events (toast / hint). The payload may be the
+                # top-level data dict itself ({type, content, finish_reason})
+                # or wrapped as {"v": {...}} — check both.
+                err = (data if isinstance(data, dict)
+                       and str(data.get("type", "")).lower() == "error" else None)
+                if err is None and isinstance(v, dict) \
+                        and str(v.get("type", "")).lower() == "error":
+                    err = v
+                if current_event == "toast" and err is not None:
                     raise RuntimeError(
-                        f"upstream_toast_error: {v.get('content') or v.get('msg') or ''} "
-                        f"({v.get('finish_reason') or 'upstream_toast_error'})"
+                        f"upstream_toast_error: {err.get('content') or err.get('msg') or ''} "
+                        f"({err.get('finish_reason') or 'upstream_toast_error'})"
                     )
-                if current_event == "hint" and isinstance(v, dict) and \
-                        str(v.get("type", "")).lower() == "error":
+                if current_event == "hint" and err is not None:
                     self._raise_hint_error(
-                        v.get("content") or v.get("msg") or "",
-                        v.get("finish_reason") or "upstream_hint_error",
+                        err.get("content") or err.get("msg") or "",
+                        err.get("finish_reason") or "upstream_hint_error",
                     )
                 if isinstance(data.get("toast"), dict) and \
                         str(data["toast"].get("type", "")).lower() == "error":
