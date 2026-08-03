@@ -18,6 +18,8 @@
 - **hif 签名头发送**：`_HifProvider` 拉取 `hif-leim/hif-dliq.deepseek.com/query`（`data.biz_data.value`，`x-hif-ttl` 缓存默认 600s），completion 请求附加 `X-Hif-Leim/Dliq`（create_session 不带）；失败静默降级（不加头）
 - **测试覆盖**：`tests/test_adapter.py`（15 用例，hint/toast/空响应重试/退避/hif）+ `tests/test_account_pool.py`（10 用例，env 兜底/池空/只读保护/持久化），全套 81 测试
 - 流式 toast/hint 检测修复：上游错误 data 为顶层 dict（非 `v` 包装），两者均检查
+- **SESSION_CACHE 模式隔离**：缓存 key 按流式/非流式区分（`stream:`/`nonstream:`），修复"流式创建 session 被非流式复用 → 空响应"；限流/空响应时 `invalidate` 缓存（失败一次后自愈）
+- **已知遗留**：同模式多轮复用 session 仍会失败一次再自愈——缓存的 `parent_message_id` 未随轮次更新（复用 session 第二次请求 parent 错误）。完整修复需从 SSE `ready` 事件提取 `response_message_id` 维护链（待办）
 
 ### v3.2.0（2026-08-02）：维护版本
 
