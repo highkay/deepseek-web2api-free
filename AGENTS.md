@@ -28,6 +28,7 @@
 - **鉴权**：`/v1/*` 的 `_check_api_auth` 现在也接受有效 admin 会话 token（`verify_admin_token`），webui 用同一 token 调模型列表与 Playground
 - **Playground 重写**：参数只保留后端真实转发的字段（`model` ↔ `model_type`、`thinking_mode` ↔ `thinking_enabled`、`search_enabled`）；temperature/top_p/max_tokens 后端忽略故不再提供；流式 `reasoning_content` 可视化（"推理过程"折叠块）
 - **上游空响应加固**（2026-08-02）：上游偶发返回 HTTP 200 + 空 SSE body（疑似临时限流/WAF 状态），此前会以"200 + 空内容"静默返回给客户端。`adapter` 新增 `UpstreamEmptyError`，`chat()`/`chat_stream()` 空响应自动换新会话重试 1 次，仍空则 `server` 非流式返回 502 明确报错（流式发错误帧）
+- **空响应根因确认**（2026-08-03）：排查定位——"空响应"绝大多数是**上游限流**：请求过频时 chat.deepseek.com 返回 200 + SSE `event: hint`（`type=error`，`finish_reason=rate_limit_reached`，内容"消息发送过于频繁，请稍后重试"）且**无任何 content token**。adapter 原先不解析 `hint` 事件 → 限流被当成空内容返回。新增 `RateLimitError`/`UpstreamHintError` 解析 hint（非流式 `_scan_hint_errors` + 流式内联检测），`server` 映射为 **429**（限流）/ 502（其他 hint 错误）
 - **hif 签名头**（2026-08-02 逆向发现）：真实浏览器会发 `x-hif-leim`/`x-hif-dliq`（可选 `x-hif-ttl`），值来自 GET `https://hif-leim.deepseek.com/query` 与 `https://hif-dliq.deepseek.com/query`（响应 `data.biz_data.value`，TTL 在 `x-hif-ttl` 头默认 600s，浏览器缓存于 localStorage `hif_leim_cached`/`hif_dliq_cached`）。当前 adapter 未发送这两个头（实测不加也可用），若未来上游强制校验需实现拉取
 - **X-Client-Version 对齐**：`2.0.0` → `2.3.0`；删除过时的 `X-App-Version` 头（真实浏览器已不再发送，经 HAR 比对确认）
 - **已知环境事实**：`wmic` 已在 Win11 24H2+ 移除；`timeout` 命令与 Git Bash 的 GNU coreutils 冲突（脚本用 `ping -n 2` 延时）
