@@ -105,9 +105,10 @@ v2.2.0 在保持向后兼容的同时引入了大量安全和功能改进：
 
 ```bash
 # 1. 克隆/下载本项目
-cd DS反代--pre-开源
+git clone https://github.com/snake-aabb-wtf/deepseek-web2api-free.git
+cd deepseek-web2api-free
 
-# 2. 安装依赖
+# 2. 安装依赖（Windows 推荐直接用 start.bat 自动创建虚拟环境并安装；手动方式：）
 pip install -r requirements.txt
 ```
 
@@ -126,6 +127,8 @@ pip install -r requirements.txt
 | `DEEPSEEK_TOKEN` | `Authorization` 请求头的 Bearer 值 | `eyJhbGciOiJIUzI1NiIs...` |
 | `DEEPSEEK_COOKIES` | `Cookie` 请求头的完整值 | `cf_clearance=xxx; session=yyy; ...` |
 
+> **两种使用方式**：① 填入 `.env` 作为池空兜底；② 直接登录 WebUI 在「账号池」页添加（推荐，可增删改 + 一键重登录）。
+
 ### 配置
 
 ```bash
@@ -140,55 +143,55 @@ cp .env.example .env
 API_KEYS=sk-change-me
 ALLOW_UNAUTHENTICATED_API=false
 
-# 必填：你的 DeepSeek 凭证（单账号兼容格式）
+# 必填：WebUI 管理面板密码（未设置默认 admin，公网部署前必须修改）
+DEEPSEEK_ADMIN_PASSWORD=change-me
+
+# 可选：DeepSeek 账号凭证（v3.2.0 起为「池空兜底」）
+# 不再预加载进账号池参与轮询；仅当面板账号数为 0 时作为只读兜底使用。
+# 推荐：直接登录 WebUI 在「账号池」页面添加账号（持久化到 data/accounts.json，可增删改）。
 DEEPSEEK_TOKEN=eyJhbGciOiJIUzI1NiIs...
 DEEPSEEK_COOKIES=cf_clearance=xxx; session=yyy; ...
+# 多账号格式同理（DEEPSEEK_TOKEN_1/COOKIES_1/EMAIL_1，取第一个有效作为兜底）
 
-# 多账号推荐格式（服务启动时加载，面板中只读）
-DEEPSEEK_TOKEN_1=eyJhbGciOiJIUzI1NiIs...
-DEEPSEEK_COOKIES_1=cf_clearance=xxx; session=yyy; ...
-DEEPSEEK_EMAIL_1=main-account
-
-DEEPSEEK_TOKEN_2=eyJhbGciOiJIUzI1NiIs...
-DEEPSEEK_COOKIES_2=cf_clearance=xxx; session=yyy; ...
-DEEPSEEK_EMAIL_2=backup-account
-
-# 面板添加的账号会持久化到 data/accounts.json
-ACCOUNT_STORE_PATH=data/accounts.json
+# 可选：模型路由（默认已启用——Playground 显示快速/专家两种模式）
+MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
 
 # 可选：API 中暴露的模型名称（不影响实际使用的模型）
 MODEL_NAME=deepseek-chat
 
-# 可选：监听端口（默认 8080）
+# 可选：监听地址/端口（默认 127.0.0.1:8080）
+HOST=127.0.0.1
 PORT=8080
 
-# 可选：模式控制
+# 可选：模式控制（auto=尊重客户端 / quick / expert）
 MODE=auto
 THINKING=auto
 SEARCH=auto
 ```
 
+完整变量说明见 `.env.example` 与 [AGENTS.md](AGENTS.md)。
+
 ### 启动
 
 ```bash
-# 方式一：直接启动（使用 .env 中的 PORT 配置）
-python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}
-
-# 方式二：使用启动脚本 start.bat（推荐）
-#   - 自动检测 / 创建虚拟环境（.venv，其次 venv / env）
-#   - 自动校验依赖，不足则安装
-#   - 自动构建 WebUI（v3.0.0 React 账号池管理面板，dist 缺失时 npm 构建；
-#     已有产物则跳过，set WEBUI_REBUILD=1 可强制重建）
+# 推荐：使用启动脚本 start.bat（Windows）
+#   - 自动定位 Python 3.10+，检测/创建虚拟环境（.venv / venv / env）
+#   - 校验依赖，不足则自动安装
+#   - WebUI 产物缺失时自动 npm 构建（set WEBUI_REBUILD=1 强制重建）
 #   - 只结束本项目的旧进程，绝不误杀占用端口的其他服务
+#   - 启动前打印访问地址，默认 3 秒后自动打开浏览器（set WEBUI_OPEN=0 跳过）
 start.bat
+
+# 手动启动（已在虚拟环境中）：
+#   .venv\Scripts\python -m uvicorn server:app --host 127.0.0.1 --port 8080
 ```
 
-启动后终端会输出：
+启动后终端会显示访问地址并自动打开浏览器；日志示例：
 ```
 INFO:     Started server process [12345]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8080
+INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
 ```
 
 ### 验证
@@ -199,7 +202,10 @@ curl http://localhost:8080/health
 
 curl http://localhost:8080/v1/models \
   -H "Authorization: Bearer sk-your-api-key"
-# → {"object":"list","data":[{"id":"deepseek-chat","object":"model","created":1234567890,"owned_by":"deepseek"}]}
+# → {"object":"list","data":[
+#      {"id":"deepseek-chat",...},
+#      {"id":"deepseek-reasoner",...}   # v3.2.0 起 MODEL_ROUTES 默认启用快速/专家两档
+#   ]}
 ```
 
 ### 管理面板
@@ -210,21 +216,17 @@ curl http://localhost:8080/v1/models \
 浏览器打开 http://localhost:8080/webui/
 ```
 
-> **构建提示（v3.0.0）**：WebUI 源码位于 `webui-new/`，首次使用前需构建：
-> ```bash
-> cd webui-new
-> npm install && npm run build   # Windows 也可直接运行 build.bat
-> ```
-> 构建产物输出到 `webui-new/dist/`。未构建时访问 `/webui` 会返回构建提示 JSON（API 功能不受影响）。
+> start.bat 会自动构建 WebUI（源码在 `webui-new/`，产物 `webui-new/dist/`）；若手动部署，需先在 `webui-new/` 执行 `npm install && npm run build`。
 
 默认密码为 `.env` 中设置的 `DEEPSEEK_ADMIN_PASSWORD`（未设置则为 `admin`）。公网部署前请务必修改默认密码。
 
-管理面板账号池支持两类账号：
+账号池支持两类账号：
 
-- `.env` 账号：通过 `DEEPSEEK_TOKEN_1/DEEPSEEK_COOKIES_1` 等变量加载，重启后保留，面板中只读。
-- 面板账号：在 WebUI 中添加/编辑/删除，持久化保存到 `data/accounts.json`，重启后保留。
+- **面板账号（推荐）**：在 WebUI 账号池页添加/编辑/删除，持久化到 `data/accounts.json`，参与轮询分配，可一键重登录。
+- **env 兜底（v3.2.0+）**：`.env` 中 `DEEPSEEK_TOKEN/COOKIES`（或 `_1` 多账号格式）作为**只读兜底**——不参与常规轮询，仅当面板账号数为 0 时自动启用，保证池空不 503。
 - **概览** — 实时请求统计（总量/成功/失败/延迟/运行时长）+ 账号池状态一览
-- **账号池** — 添加/删除账号，一键重登录异常账号
+- **Playground** — 在线测试对话（快速/专家两种模型模式，支持推理过程可视化）
+- **设置** — 只读查看当前生效的运行时配置
 
 ---
 
