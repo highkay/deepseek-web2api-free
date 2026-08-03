@@ -237,6 +237,7 @@ class DeepSeekAdapter:
         self.token = self._normalize_token(token)
         self.cookies = cookies
         self.impersonate = impersonate
+        self.proxy = proxy
         self._solver = None
         # curl_cffi.Session keeps a cookie jar that auto-merges Set-Cookie,
         # so cf_clearance / AWS WAF tokens stay fresh across calls.
@@ -499,7 +500,19 @@ class DeepSeekAdapter:
             "search_enabled": search_enabled,
             "preempt": False,
         }
-        resp = self._client.post(
+        # Non-streaming calls use a fresh Session: a pooled connection left
+        # dirty by a previously streamed call (iter_lines abandoned on the
+        # FINISHED status) could otherwise be reused here and return an
+        # empty body. The extra TLS handshake is negligible for non-stream.
+        if stream:
+            client = self._client
+        else:
+            client = cffi_requests.Session(
+                impersonate=self.impersonate,
+                timeout=120,
+                proxies={"all": self.proxy} if self.proxy else None,
+            )
+        resp = client.post(
             f"{BASE_URL}/api/v0/chat/completion",
             json=body,
             headers=headers,
@@ -638,7 +651,16 @@ class DeepSeekAdapter:
                         content_parts.append(token)
                 continue
 
-        return "".join(content_parts), "".join(thinking_parts)
+        content = "".join(content_parts)
+        thinking = "".join(thinking_parts)
+        # Defense-in-depth: a response with neither visible content nor
+        # reasoning is almost never legitimate (upstream occasionally
+        # returns an empty SSE after a streamed call). Surface it as an
+        # UpstreamEmptyError so the caller retries once with a fresh
+        # session instead of silently returning empty content.
+        if not content and not thinking:
+            raise UpstreamEmptyError("upstream returned empty content")
+        return content, thinking
 
     def chat_stream(self, session_id: str, prompt: str,
                     model_type: str | None = None,

@@ -133,6 +133,33 @@ class TestChatRetry:
         with pytest.raises(UpstreamEmptyError):
             ad.chat("sess-1", "prompt")
 
+    def test_nonempty_sse_without_content_retries(self, monkeypatch):
+        """SSE with no content tokens and no hint is treated as empty and
+        retried once (defense against stale pooled connections)."""
+        ad = _adapter()
+        calls = {"n": 0}
+        empty_sse = (
+            "event: ready\ndata: {\"request_message_id\":1}\n\n"
+            "event: update_session\ndata: {}\n\n"
+            "data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n"
+            "event: close\ndata: {}\n\n"
+        )
+
+        def fake_send(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _FakeResp(empty_sse)
+            return _FakeResp(
+                "event: ready\ndata: {\"request_message_id\":1}\n\n"
+                "data: {\"v\":\"重试内容\"}\n\n"
+            )
+
+        monkeypatch.setattr(ad, "_send_completion", fake_send)
+        monkeypatch.setattr(ad, "create_session", lambda: "sess-2")
+        content, _ = ad.chat("sess-1", "prompt")
+        assert content == "重试内容"
+        assert calls["n"] == 2
+
     def test_rate_limit_backoff_then_success(self, monkeypatch):
         ad = _adapter()
         calls = {"n": 0}

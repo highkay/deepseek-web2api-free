@@ -600,12 +600,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     else:
         search = req.search_enabled or False
 
+    # Session cache keys are mode-scoped: reusing a session created by a
+    # streamed call from a non-streaming call (or vice versa) makes the
+    # upstream return an empty response. Same-mode multi-turn still works.
+    openai_user = _extract_openai_user(req.messages, request)
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search, rate_headers=rate_headers,
-                                    cache_key=_extract_openai_user(req.messages, request))
+                                    cache_key=f"stream:{openai_user}")
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search,
-                             cache_key=_extract_openai_user(req.messages, request))
+                             cache_key=f"nonstream:{openai_user}")
 
 
 # ---- Anthropic /v1/messages endpoint ----
@@ -667,17 +671,18 @@ async def messages(req: AnthropicRequest, request: Request):
             if t.name:
                 tool_names.append(t.name)
 
+    anth_user = _extract_anthropic_user(req, request)
     if req.stream:
         return await _anthropic_stream(proxy_id, prompt, tool_names,
                                        model_type=model_type, thinking_mode=thinking,
                                        search_enabled=search,
                                        rate_headers=rate_headers,
-                                       cache_key=_extract_anthropic_user(req, request))
+                                       cache_key=f"stream:{anth_user}")
 
     return _anthropic_nonstream(proxy_id, prompt, tool_names,
                                 model_type=model_type, thinking_mode=thinking,
                                 search_enabled=search,
-                                cache_key=_extract_anthropic_user(req, request))
+                                cache_key=f"nonstream:{anth_user}")
 
 
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
@@ -694,7 +699,11 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
+        if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+            if cache_key:
+                SESSION_CACHE.invalidate(cache_key)
+        else:
+            pool.mark_error(acq.acct, str(e))
         raise
     finally:
         acq.release()
@@ -740,7 +749,11 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
         except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
-            pool.mark_error(acq.acct, str(e))
+            if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+                if cache_key:
+                    SESSION_CACHE.invalidate(cache_key)
+            else:
+                pool.mark_error(acq.acct, str(e))
             raise
         finally:
             acq.release()
@@ -776,16 +789,24 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000,
                            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     except RateLimitError as e:
+        # Rate limiting is a transient upstream state, not a credential
+        # problem — do NOT mark the account as errored, or the pool would
+        # drain to 503 once the limiter cools down. Invalidate the cached
+        # session so the next call starts fresh.
         get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
+        if cache_key:
+            SESSION_CACHE.invalidate(cache_key)
         raise HTTPException(status_code=429, detail=f"上游限流：{e.args[0] if e.args else '请求过于频繁'}，请稍后重试")
     except UpstreamHintError as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))
         raise HTTPException(status_code=502, detail=str(e))
     except UpstreamEmptyError as e:
+        # Transient empty responses (stale pooled connection / upstream
+        # hiccup) — retried in the adapter already; do not poison the pool.
         get_stats().record(MODEL_NAME, 0, success=False)
-        pool.mark_error(acq.acct, str(e))
+        if cache_key:
+            SESSION_CACHE.invalidate(cache_key)
         raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
@@ -955,7 +976,13 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
         except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False,
                                prompt_tokens=prompt_tokens)
-            pool.mark_error(acq.acct, str(e))
+            # Rate limit / transient empty responses are not credential
+            # failures — keep the account usable instead of draining the pool.
+            if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+                if cache_key:
+                    SESSION_CACHE.invalidate(cache_key)
+            else:
+                pool.mark_error(acq.acct, str(e))
             log.exception("openai_stream_failed")
             # Emit a uniform error frame to the client, then [DONE] so the
             # client SDK doesn't see a truncated stream.
