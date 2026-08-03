@@ -70,6 +70,18 @@ class UpstreamEmptyError(RuntimeError):
     """
 
 
+class UpstreamHintError(RuntimeError):
+    """Raised when the upstream signals an error via an SSE ``hint`` event
+    (``type=error``) instead of an HTTP error — e.g. rate limiting. The
+    adapter previously ignored these, surfacing them as empty content.
+    """
+
+
+class RateLimitError(UpstreamHintError):
+    """Upstream rate limiting (finish_reason ``rate_limit_reached``:
+    '消息发送过于频繁，请稍后重试'). Maps to HTTP 429 on the server side."""
+
+
 class _WASMSolver:
     """WASM-based PoW solver (reused across calls) — thread-safe via lock."""
 
@@ -347,6 +359,34 @@ class DeepSeekAdapter:
             return content, finish_reason
         return None
 
+    @staticmethod
+    def _scan_hint_errors(events):
+        """Return the first upstream ``hint`` error in ``events`` as
+        ``(message, finish_reason)`` or ``None``.
+
+        Rate limiting arrives as an SSE ``event: hint`` frame with
+        ``type=error`` and ``finish_reason=rate_limit_reached``
+        ('消息发送过于频繁，请稍后重试'). Previously unparsed, so a
+        rate-limited request looked like a successful empty completion.
+        """
+        for event_type, data in events:
+            if event_type != "hint" or not isinstance(data, dict):
+                continue
+            if str(data.get("type", "")).lower() != "error":
+                continue
+            content = data.get("content") or data.get("msg") or ""
+            finish_reason = data.get("finish_reason") or "upstream_hint_error"
+            return content, finish_reason
+        return None
+
+    @staticmethod
+    def _raise_hint_error(content: str, finish_reason: str):
+        if finish_reason == "rate_limit_reached" or "频繁" in (content or ""):
+            raise RateLimitError(content or "rate limited", finish_reason)
+        raise UpstreamHintError(
+            f"upstream_hint_error: {content or ''} ({finish_reason})"
+        )
+
     def _send_completion(self, session_id: str, prompt: str, stream: bool = False,
                          model_type: str | None = None,
                          thinking_enabled: bool = False, search_enabled: bool = False,
@@ -432,6 +472,13 @@ class DeepSeekAdapter:
         toast = self._scan_toast_errors(events)
         if toast is not None:
             raise RuntimeError(f"upstream_toast_error: {toast[0]} ({toast[1]})")
+
+        # Rate limiting arrives as an `event: hint` with type=error
+        # (finish_reason=rate_limit_reached). Surface it instead of
+        # returning an empty completion.
+        hint = self._scan_hint_errors(events)
+        if hint is not None:
+            self._raise_hint_error(hint[0], hint[1])
 
         # Collect all content from both normal mode and expert fragment mode
         content_parts = []
@@ -617,6 +664,12 @@ class DeepSeekAdapter:
                     raise RuntimeError(
                         f"upstream_toast_error: {v.get('content') or v.get('msg') or ''} "
                         f"({v.get('finish_reason') or 'upstream_toast_error'})"
+                    )
+                if current_event == "hint" and isinstance(v, dict) and \
+                        str(v.get("type", "")).lower() == "error":
+                    self._raise_hint_error(
+                        v.get("content") or v.get("msg") or "",
+                        v.get("finish_reason") or "upstream_hint_error",
                     )
                 if isinstance(data.get("toast"), dict) and \
                         str(data["toast"].get("type", "")).lower() == "error":
