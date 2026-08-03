@@ -8,6 +8,17 @@
 
 ---
 
+## v3.2.1 修复
+
+2026-08-03 补丁版本——**定位并修复流式/非流式空响应的根因**：
+
+- **上游限流提示被吞**：请求过频时 chat.deepseek.com 返回 HTTP 200 + SSE `event: hint`（`finish_reason=rate_limit_reached`，"消息发送过于频繁，请稍后重试"）且无内容 token；adapter 原先不解析 `hint` 事件，把限流当成"空内容"返回
+- **修复**：新增 `RateLimitError`/`UpstreamHintError` 解析 hint（流式 + 非流式），`/v1/chat/completions` 限流时返回 **HTTP 429** 明确报错（不再静默返回 200 空内容），其他 hint 错误返回 502
+- 实用建议：低频请求（`DEEPSEEK_JITTER_SECS=0.4`）或多账号分摊，避免触发上游限流
+- 详见 [docs/release-notes/v3.2.1.md](docs/release-notes/v3.2.1.md)
+
+---
+
 ## v3.2.0 新增
 
 2026-08 维护版本（基于 v3.0.0），主要改进：
