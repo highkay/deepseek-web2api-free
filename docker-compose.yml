@@ -33,18 +33,14 @@ services:
     image: ${IMAGE:-ghcr.sparkcr.cn/highkay/deepseek-web2api-free:latest}
     build:
       context: .
-      # BuildKit auto-injects the host's HTTP_PROXY/HTTPS_PROXY as build
-      # args; inside the build container 127.0.0.1 is NOT the host, so the
-      # injected proxy breaks `pip install` ("Cannot connect to proxy").
-      # Explicitly clear them by default; override via .env:
-      #   BUILD_HTTP_PROXY=http://172.17.0.1:7890   (host gateway, not 127.0.0.1)
-      #   BUILD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+      # The Dockerfile disables proxy env vars inside the build (BuildKit
+      # would otherwise inject the daemon's 127.0.0.1 proxy, which is not the
+      # host from inside a build container). Package installs go straight to
+      # the indexes/mirrors below; set them via .env when the network needs
+      # them (e.g. CN): BUILD_PIP_INDEX_URL / BUILD_NPM_REGISTRY.
       args:
-        http_proxy: ${BUILD_HTTP_PROXY:-}
-        https_proxy: ${BUILD_HTTPS_PROXY:-}
-        all_proxy: ${BUILD_ALL_PROXY:-}
-        no_proxy: ${BUILD_NO_PROXY:-localhost,127.0.0.1,::1}
         PIP_INDEX_URL: ${BUILD_PIP_INDEX_URL:-}
+        NPM_REGISTRY: ${BUILD_NPM_REGISTRY:-}
     container_name: deepseek-web2api
     restart: unless-stopped
     init: true          # tini as PID 1 — proper SIGTERM handling
@@ -67,7 +63,8 @@ services:
       # 持久化 WebUI 账号池数据（data/accounts.json）。
       # 命名卷从镜像初始化，权限自动匹配容器内 appuser，无需手动 chown。
       - data:/app/data
-      # 可选: 挂载宿主机构建的 WebUI 产物，免重建镜像即可更新面板
+      # WebUI（webui-new/dist）已由 Dockerfile 的 Node 阶段构建并内置进镜像。
+      # 仅在宿主机自行改前端时，可挂载本地构建的 dist 覆盖（免重建镜像热更新）：
       # - ./webui-new/dist:/app/webui-new/dist:ro
 
     extra_hosts:

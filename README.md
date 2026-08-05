@@ -233,7 +233,7 @@ curl http://localhost:28080/health
 - **数据持久化**：WebUI 账号池数据保存在命名卷 `data`（容器内 `data/accounts.json`），`docker compose down` 不丢失；`docker compose down -v` 会删除（慎用）
 - **更新**：`git pull && docker compose pull && docker compose up -d`（镜像标签固定为 `latest`，拉取即更新）
 - **本地构建**（可选，不依赖 CI）：`docker compose up -d --build`
-- **管理面板**：http://localhost:28080/webui/
+- **管理面板**：http://localhost:28080/webui/ —— **已内置在镜像中**（Dockerfile Node 阶段自动构建 React WebUI，无需手动 npm build）
 - **重启策略**：`restart: unless-stopped`，宿主机 / Docker 重启后自动拉起
 
 #### 镜像约定（ghcr.io ↔ ghcr.sparkcr.cn 镜像站）

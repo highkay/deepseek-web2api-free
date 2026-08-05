@@ -224,6 +224,7 @@ uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080} --reload
 
 **约定**：
 - **端口默认 `28080`**（高位，规避与 8080 等冲突）；`PORT` 环境变量可覆盖，compose 端口映射与 healthcheck 自动跟随 `.env` 的 `PORT`
+- **WebUI 已内置镜像**：Dockerfile 多阶段构建（Node 阶段 `npm ci && npm run build` 产出 `webui-new/dist` 打进镜像），Docker 部署无需手动 npm build；本地改前端可挂载 `webui-new/dist` 覆盖
 - **镜像源**：CI 推官方 `ghcr.io/highkay/deepseek-web2api-free:latest`（tag `v*` → 版本 + latest，任意 push → latest + sha-<short>，amd64/arm64）；本机默认拉 `ghcr.sparkcr.cn/highkay/deepseek-web2api-free:latest`（sparkcr.cn 镜像 ghcr.io，格式 `ghcr.sparkcr.cn/<owner>/<img>:<tag>`）；用 `IMAGE` 环境变量可切回官方源
 - **数据持久化**：compose 命名卷 `data`（`data/accounts.json`），`docker compose down -v` 才删除
 - **代理注意**：adapter 只认 `DEEPSEEK_PROXY` 系变量（不读容器内 `HTTP_PROXY`）；宿主机 Clash（127.0.0.1:7890）在容器内访问需 `DEEPSEEK_PROXY=http://host.docker.internal:7890`（compose 已 `extra_hosts` 映射）。构建期 pip 失败用 `--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 或 `http_proxy=http://172.17.0.1:7890`（网关地址=宿主机）

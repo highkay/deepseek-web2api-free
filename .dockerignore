@@ -14,9 +14,11 @@ data/
 __pycache__/
 *.pyc
 
-# ── Frontend build artefacts (source is copied; node_modules is huge) ──
+# ── Frontend ─────────────────────────────────────────────────
 webui-new/node_modules/
 webui-new/.vite/
+# dist is produced by the Node stage (Dockerfile); never take a stale local copy
+webui-new/dist/
 
 # ── Not needed at runtime ───────────────────────────────────────
 tests/
