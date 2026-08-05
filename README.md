@@ -168,9 +168,9 @@ MODEL_ROUTES={"deepseek-chat":"default","deepseek-reasoner":"expert"}
 # 可选：API 中暴露的模型名称（不影响实际使用的模型）
 MODEL_NAME=deepseek-chat
 
-# 可选：监听地址/端口（默认 127.0.0.1:8080）
+# 可选：监听地址/端口（默认 127.0.0.1:28080）
 HOST=127.0.0.1
-PORT=8080
+PORT=28080
 
 # 可选：模式控制（auto=尊重客户端 / quick / expert）
 MODE=auto
@@ -192,7 +192,7 @@ SEARCH=auto
 start.bat
 
 # 手动启动（已在虚拟环境中）：
-#   .venv\Scripts\python -m uvicorn server:app --host 127.0.0.1 --port 8080
+#   .venv\Scripts\python -m uvicorn server:app --host 127.0.0.1 --port 28080
 ```
 
 启动后终端会显示访问地址并自动打开浏览器；日志示例：
@@ -200,16 +200,83 @@ start.bat
 INFO:     Started server process [12345]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
+INFO:     Uvicorn running on http://127.0.0.1:28080 (Press CTRL+C to quit)
 ```
+
+### Docker 部署（推荐）
+
+> 前置：Docker Engine + Docker Compose v2（`docker compose version` 可验证）。
+> 无需 Python / Node 环境；镜像由 GitHub Actions 构建（见 [.github/workflows/docker-image.yml](.github/workflows/docker-image.yml)），本机直接从**镜像站**拉取。
+
+```bash
+# 1. 准备配置
+cp .env.example .env
+# 编辑 .env：
+#   - DEEPSEEK_TOKEN / DEEPSEEK_COOKIES（DeepSeek 凭证；也可之后在 WebUI「账号池」页添加）
+#   - DEEPSEEK_ADMIN_PASSWORD 必须设为强密码（容器内监听 0.0.0.0，弱密码/默认密码会拒绝启动）
+#   - API_KEYS（公网部署保护 /v1/* 必填）
+
+# 2. 拉取镜像并启动（默认从镜像站 ghcr.sparkcr.cn 拉取，规避 ghcr.io 网络问题）
+docker compose pull
+docker compose up -d
+
+# 3. 查看状态 / 日志
+docker compose ps
+docker compose logs -f
+
+# 4. 验证
+curl http://localhost:28080/health
+# → {"status":"ok"}
+```
+
+- **端口**：默认 **28080**（高位端口，避免与 8080 等常见服务冲突）；可在 `.env` 用 `PORT` 修改，端口映射自动跟随
+- **数据持久化**：WebUI 账号池数据保存在命名卷 `data`（容器内 `data/accounts.json`），`docker compose down` 不丢失；`docker compose down -v` 会删除（慎用）
+- **更新**：`git pull && docker compose pull && docker compose up -d`（镜像标签固定为 `latest`，拉取即更新）
+- **本地构建**（可选，不依赖 CI）：`docker compose up -d --build`
+- **管理面板**：http://localhost:28080/webui/
+- **重启策略**：`restart: unless-stopped`，宿主机 / Docker 重启后自动拉起
+
+#### 镜像约定（ghcr.io ↔ ghcr.sparkcr.cn 镜像站）
+
+CI 构建多架构（amd64/arm64）镜像并推送到官方 GitHub Container Registry：
+
+```
+ghcr.io/highkay/deepseek-web2api-free:latest     ← 官方源
+ghcr.io/highkay/deepseek-web2api-free:v3.2.2     ← 版本标签（v* tag 触发）
+```
+
+国内环境直接拉 `ghcr.io` 常因网络问题失败，本项目默认配置为从 **sparkcr.cn 镜像站**拉取（`docker-compose.yml` 中 `image:` 字段），格式规则：
+
+```
+官方:  ghcr.io/<owner>/<image>:<tag>
+镜像站: ghcr.sparkcr.cn/<owner>/<image>:<tag>     ← sparkcr.cn 镜像 ghcr.io
+```
+
+```bash
+# 手动拉取示例（与 compose 默认行为等价）
+docker pull ghcr.sparkcr.cn/highkay/deepseek-web2api-free:latest
+# 如需切回官方源，在 .env 中覆盖:
+# IMAGE=ghcr.io/highkay/deepseek-web2api-free:latest
+```
+
+#### 系统代理导致的网络问题（重要）
+
+本机若开了系统代理（如 Clash 监听 `127.0.0.1:7890`），Docker 构建/运行会遇到几类典型问题，按表处理：
+
+| 场景 | 现象 | 解决 |
+|------|------|------|
+| `docker pull` 拉基础镜像失败 | registry 连接超时 | 给 Docker daemon 配置代理或镜像加速（本项目 CI 产物走 ghcr.sparkcr.cn 镜像站，一般无需拉 ghcr.io） |
+| 构建时 `pip install` 失败 | 报 `ProxyError: Cannot connect to proxy`，或访问 PyPI 超时/被墙 | **原因**：BuildKit 会把宿主机 `HTTP_PROXY`（如 `http://127.0.0.1:7890`）自动注入构建容器，但容器内 `127.0.0.1` 是容器自身而非宿主机 → pip 连代理被拒。**解决**（compose 默认已清空代理参数，命令行 `--build-arg` 会被 compose 覆盖，推荐用 `.env` 变量）：<br>· 用 PyPI 镜像，`.env` 写 `BUILD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`<br>· 或让 pip 走**宿主机网关**代理，`.env` 写 `BUILD_HTTP_PROXY=http://172.17.0.1:7890`、`BUILD_HTTPS_PROXY=http://172.17.0.1:7890`（网关地址 `172.17.0.1`/`host.docker.internal` ≠ 容器内 `127.0.0.1`） |
+| 运行期容器无法访问 chat.deepseek.com | 上游超时/502，日志报连接失败 | adapter **只认 `DEEPSEEK_PROXY` 系列变量**，不读取容器内 `HTTP_PROXY` 环境变量。在 `.env` 显式配置：`DEEPSEEK_PROXY=http://host.docker.internal:7890`（compose 已启用 `host.docker.internal:host-gateway`）；多账号用 `DEEPSEEK_PROXY_N` |
+| 容器访问宿主机其他服务被拒 | connection refused | 宿主机服务需监听 `0.0.0.0`，容器内用 `host.docker.internal` / `172.17.0.1` 访问宿主机 |
 
 ### 验证
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:28080/health
 # → {"status":"ok"}
 
-curl http://localhost:8080/v1/models \
+curl http://localhost:28080/v1/models \
   -H "Authorization: Bearer sk-your-api-key"
 # → {"object":"list","data":[
 #      {"id":"deepseek-chat",...},
@@ -222,7 +289,7 @@ curl http://localhost:8080/v1/models \
 项目内置 Web 管理界面（v3.0.0 起为 React SPA），提供请求统计和账号池管理功能：
 
 ```
-浏览器打开 http://localhost:8080/webui/
+浏览器打开 http://localhost:28080/webui/
 ```
 
 > start.bat 会自动构建 WebUI（源码在 `webui-new/`，产物 `webui-new/dist/`）；若手动部署，需先在 `webui-new/` 执行 `npm install && npm run build`。
@@ -493,7 +560,7 @@ data: [DONE]
 ```python
 import openai
 
-client = openai.Client(base_url="http://localhost:8080/v1", api_key="sk-your-api-key")
+client = openai.Client(base_url="http://localhost:28080/v1", api_key="sk-your-api-key")
 
 response = client.chat.completions.create(
     model="deepseek-chat",
@@ -544,7 +611,7 @@ DeepSeek Chat 协议本身支持 `parent_message_id` 串接同 `chat_session_id`
 
 ```bash
 # OpenAI 多轮示例（带 X-Conversation-Id 头）
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:28080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "X-Conversation-Id: user-42-session-7" \
   -H "Content-Type: application/json" \
@@ -773,12 +840,12 @@ Windows bash curl 默认编码为 GBK，发送 JSON 时中文字符可能被错�
 
 ```bash
 # 方式一：将请求体写入 JSON 文件
-curl -X POST http://localhost:8080/v1/chat/completions \
+curl -X POST http://localhost:28080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d @body.json
 
 # 方式二：用 PowerShell（推荐）
-Invoke-RestMethod -Uri http://localhost:8080/v1/chat/completions `
+Invoke-RestMethod -Uri http://localhost:28080/v1/chat/completions `
   -Method POST `
   -ContentType "application/json" `
   -Body '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}],"stream":true}'
@@ -792,7 +859,7 @@ Invoke-RestMethod -Uri http://localhost:8080/v1/chat/completions `
 # 先杀掉旧进程
 taskkill /F /IM python.exe
 # 再重新启动
-python -m uvicorn server:app --host 0.0.0.0 --port 8080
+python -m uvicorn server:app --host 0.0.0.0 --port 28080
 ```
 
 ### Q: 浏览器插件（如 YouTube 字幕翻译）请求失败，日志显示 405 Method Not Allowed
@@ -827,7 +894,7 @@ DeepSeek 的 Token 有效期不明确。如果遇到 `401` 或 `403` 响应，�
 | 变量 | 默认值 | 必填 | 说明 |
 |------|--------|------|------|
 | `HOST` | `127.0.0.1` | 否 | 监听地址。`0.0.0.0` 配合默认 admin 密码时拒绝启动 |
-| `PORT` | `8080` | 否 | 服务器监听端口 |
+| `PORT` | `28080` | 否 | 服务器监听端口 |
 | `API_KEYS` | `""` | 公网部署必填 | 客户端访问 `/v1/*` 的 API Key，支持逗号分隔多个 key |
 | `DEEPSEEK_API_KEY` | `""` | 否 | 单个客户端 API Key 别名 |
 | `ALLOW_UNAUTHENTICATED_API` | `false` | 否 | 是否允许 `/v1/*` 无鉴权访问；公网部署不要开启 |

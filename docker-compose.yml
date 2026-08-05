@@ -1,0 +1,92 @@
+# ── DeepSeek Chat API Proxy — minimal Docker Compose deployment ─────────────
+#
+# 快速开始:
+#   1. cp .env.example .env  然后编辑 .env:
+#      - DEEPSEEK_TOKEN / DEEPSEEK_COOKIES（DeepSeek 凭证；也可之后在 WebUI「账号池」添加）
+#      - DEEPSEEK_ADMIN_PASSWORD 必须设置为强密码（容器内监听 0.0.0.0，
+#        弱密码 / 默认密码会导致服务拒绝启动）
+#      - API_KEYS（公网部署保护 /v1/* 必填）
+#   2. 拉取镜像并启动（推荐，走镜像站 ghcr.sparkcr.cn 规避 ghcr.io 网络问题）:
+#        docker compose pull && docker compose up -d
+#      或本地构建:
+#        docker compose up -d --build
+#   3. 验证: curl http://localhost:28080/health  →  {"status":"ok"}
+#      管理面板: http://localhost:28080/webui/
+#
+# 镜像约定:
+#   - CI（.github/workflows/docker-image.yml）构建 amd64/arm64 镜像并推送
+#     ghcr.io/highkay/deepseek-web2api-free（latest / v* 标签）
+#   - 本机默认从镜像站拉取: ghcr.sparkcr.cn/highkay/deepseek-web2api-free:latest
+#     （sparkcr.cn 是 ghcr.io 的国内镜像站，格式为 ghcr.sparkcr.cn/<owner>/<image>:<tag>）
+#   - 可用环境变量 IMAGE 覆盖，例如 .env 里写 IMAGE=ghcr.io/highkay/deepseek-web2api-free:latest
+#
+# 系统代理网络问题:
+#   - 构建期 pip 失败 → 见 Dockerfile 头部（PIP_INDEX_URL 镜像 或
+#     http_proxy=http://172.17.0.1:7890 指向宿主机网关）
+#   - 运行期容器访问 chat.deepseek.com 需走宿主机代理 → .env 配置
+#     DEEPSEEK_PROXY=http://host.docker.internal:7890
+#     （adapter 只认 DEEPSEEK_PROXY 系列变量，不认容器内 HTTP_PROXY 环境变量；
+#      下方 extra_hosts 已启用 host.docker.internal → 宿主机）
+
+services:
+  deepseek-web2api:
+    image: ${IMAGE:-ghcr.sparkcr.cn/highkay/deepseek-web2api-free:latest}
+    build:
+      context: .
+      # BuildKit auto-injects the host's HTTP_PROXY/HTTPS_PROXY as build
+      # args; inside the build container 127.0.0.1 is NOT the host, so the
+      # injected proxy breaks `pip install` ("Cannot connect to proxy").
+      # Explicitly clear them by default; override via .env:
+      #   BUILD_HTTP_PROXY=http://172.17.0.1:7890   (host gateway, not 127.0.0.1)
+      #   BUILD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+      args:
+        http_proxy: ${BUILD_HTTP_PROXY:-}
+        https_proxy: ${BUILD_HTTPS_PROXY:-}
+        all_proxy: ${BUILD_ALL_PROXY:-}
+        no_proxy: ${BUILD_NO_PROXY:-localhost,127.0.0.1,::1}
+        PIP_INDEX_URL: ${BUILD_PIP_INDEX_URL:-}
+    container_name: deepseek-web2api
+    restart: unless-stopped
+    init: true          # tini as PID 1 — proper SIGTERM handling
+
+    # 从 .env 注入全部配置（凭证、MODE/THINKING/SEARCH、限流等）
+    env_file: .env
+    environment:
+      # 容器内必须监听 0.0.0.0 才能对外映射端口。
+      # 注意: 0.0.0.0 + 弱 DEEPSEEK_ADMIN_PASSWORD 会拒绝启动，
+      # 请先在 .env 设置强管理密码。
+      HOST: 0.0.0.0
+      # TZ: Asia/Shanghai   # 需要固定容器时区时取消注释
+
+    ports:
+      # 宿主机端口:容器内端口，跟随 .env 的 PORT。
+      # 默认高位端口 28080，避免与常见服务（8080 等）冲突。
+      - "${PORT:-28080}:${PORT:-28080}"
+
+    volumes:
+      # 持久化 WebUI 账号池数据（data/accounts.json）。
+      # 命名卷从镜像初始化，权限自动匹配容器内 appuser，无需手动 chown。
+      - data:/app/data
+      # 可选: 挂载宿主机构建的 WebUI 产物，免重建镜像即可更新面板
+      # - ./webui-new/dist:/app/webui-new/dist:ro
+
+    extra_hosts:
+      # 让容器内可用 http://host.docker.internal:PORT 访问宿主机服务
+      # （配合 .env 中 DEEPSEEK_PROXY=http://host.docker.internal:7890 使用）
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${PORT:-28080}/health', timeout=5)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:

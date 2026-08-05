@@ -20,3 +20,6 @@ webui-new/.vite/
 # Test artefacts
 .pytest_cache/
 *.egg-info/
+
+# Agent working files (plans, scratch) — not part of the product
+.omo/

@@ -1,0 +1,24 @@
+# ── Never bake secrets into the image ──────────────────────────
+.env
+.env.*
+data/
+
+# ── VCS / tooling / CI ─────────────────────────────────────────
+.git
+.github
+.codegraph
+.pytest_cache/
+*.egg-info/
+
+# ── Python bytecode ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── Frontend build artefacts (source is copied; node_modules is huge) ──
+webui-new/node_modules/
+webui-new/.vite/
+
+# ── Not needed at runtime ───────────────────────────────────────
+tests/
+docs/
+scripts/

@@ -132,16 +132,22 @@ D:\the llaa\DS反代 --pre\
 ├── admin.py               # 管理后台 API（密码认证、请求统计、账号池管理）
 ├── tool_dsml.py           # DSML 格式解析器（工具调用协议）
 ├── tool_sieve.py          # 流式筛分引擎（实时检测工具调用标签）
-├── sha3_wasm_bg.wasm      # PoW 哈希引擎 WASM 二进制
-├── start.bat              # Windows 一键启动脚本（自动 venv/依赖/WebUI/开浏览器）
-├── webui-new/             # 管理面板前端（v3.0.0+，React SPA，需 npm 构建）
-│   └── dist/              #   构建产物（gitignored），server.py 伺服于 /webui/*
-├── .env                   # 环境配置（含 TOKEN/COOKIE，不提交）
-├── .env.example           # 配置模板（提交到仓库）
-├── requirements.txt       # Python 依赖
-├── README.md              # 用户文档
-└── AGENTS.md              # 本文件
-```
+ ├── sha3_wasm_bg.wasm      # PoW 哈希引擎 WASM 二进制
+ ├── start.bat              # Windows 一键启动脚本（自动 venv/依赖/WebUI/开浏览器）
+ ├── Dockerfile             # 最小镜像（python:3.12-slim，非 root，代理/镜像 build-args）
+ ├── docker-compose.yml     # 最简 compose 部署（镜像站拉取 + 数据卷 + healthcheck）
+ ├── .dockerignore          # 排除 .env/data/node_modules 等，防止密钥进镜像
+ ├── .github/workflows/
+ │   ├── ci.yml             # 冒烟 + pytest 测试
+ │   └── docker-image.yml   # 构建 amd64/arm64 镜像推送 GHCR（latest / v* / sha-*）
+ ├── webui-new/             # 管理面板前端（v3.0.0+，React SPA，需 npm 构建）
+ │   └── dist/              #   构建产物（gitignored），server.py 伺服于 /webui/*
+ ├── .env                   # 环境配置（含 TOKEN/COOKIE，不提交）
+ ├── .env.example           # 配置模板（提交到仓库）
+ ├── requirements.txt       # Python 依赖
+ ├── README.md              # 用户文档
+ └── AGENTS.md              # 本文件
+ ```
 
 ### 2.1 文件详细说明
 
@@ -207,7 +213,22 @@ uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080} --reload
 ```
 `--reload` 会在文件变更时自动重启，但注意它不会自动清理 `__pycache__`（见 §18.5）。
 
-### 2.3 预览版 vs 开源版差异
+### 2.3 Docker 部署（镜像站拉取）
+
+最简部署走 CI 镜像：
+
+1. `cp .env.example .env`，编辑凭证（`DEEPSEEK_TOKEN/COOKIES`）、**强** `DEEPSEEK_ADMIN_PASSWORD`（容器内监听 `0.0.0.0`，弱密码拒绝启动）、`API_KEYS`
+2. `docker compose pull && docker compose up -d` — 从镜像站 `ghcr.sparkcr.cn` 拉取 `latest`（规避 ghcr.io 网络问题）
+3. 验证 `curl http://localhost:28080/health`；面板 `http://localhost:28080/webui/`
+4. 更新：`git pull && docker compose pull && docker compose up -d`
+
+**约定**：
+- **端口默认 `28080`**（高位，规避与 8080 等冲突）；`PORT` 环境变量可覆盖，compose 端口映射与 healthcheck 自动跟随 `.env` 的 `PORT`
+- **镜像源**：CI 推官方 `ghcr.io/highkay/deepseek-web2api-free:latest`（tag `v*` → 版本 + latest，任意 push → latest + sha-<short>，amd64/arm64）；本机默认拉 `ghcr.sparkcr.cn/highkay/deepseek-web2api-free:latest`（sparkcr.cn 镜像 ghcr.io，格式 `ghcr.sparkcr.cn/<owner>/<img>:<tag>`）；用 `IMAGE` 环境变量可切回官方源
+- **数据持久化**：compose 命名卷 `data`（`data/accounts.json`），`docker compose down -v` 才删除
+- **代理注意**：adapter 只认 `DEEPSEEK_PROXY` 系变量（不读容器内 `HTTP_PROXY`）；宿主机 Clash（127.0.0.1:7890）在容器内访问需 `DEEPSEEK_PROXY=http://host.docker.internal:7890`（compose 已 `extra_hosts` 映射）。构建期 pip 失败用 `--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 或 `http_proxy=http://172.17.0.1:7890`（网关地址=宿主机）
+
+### 2.4 预览版 vs 开源版差异
 
 > **v3.0.0 起已合并**：以下对比仅作历史参考。当前主线同时具备左右两列全部能力（OpenAI + Anthropic + 专家模式 + 联网搜索 + 工具调用 + React WebUI）。
 
