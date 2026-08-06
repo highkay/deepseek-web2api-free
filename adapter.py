@@ -304,7 +304,8 @@ class DeepSeekAdapter:
 
     @staticmethod
     def login(email: str = "", mobile: str = "",
-              password: str = "", timeout: float = 30) -> tuple[str, str]:
+              password: str = "", timeout: float = 30,
+              proxy: str | None = None) -> tuple[str, str]:
         """Login to DeepSeek with email/mobile + password, return (token, cookies).
 
         Uses plain httpx (no curl_cffi) with Android-style headers matching
@@ -313,7 +314,13 @@ class DeepSeekAdapter:
         semicolon-separated ``name=value`` pairs from the login response's
         ``Set-Cookie`` headers (suitable for seeding the curl_cffi cookie jar).
 
-        Raises ``RuntimeError`` on login failure (bad credentials, network error).
+        ``proxy`` is optional. If not set, proxy is read from
+        ``DEEPSEEK_PROXY`` env var. The httpx client ignores the system
+        ``HTTP_PROXY`` / ``HTTPS_PROXY`` environment variables (which often
+        point at a non-existent 127.0.0.1:7890 inside containers) — only
+        the explicit ``proxy`` param or ``DEEPSEEK_PROXY`` env var is used.
+
+        Raises ``RuntimeError`` on login failure.
         """
         if not password:
             raise ValueError("password is required")
@@ -348,13 +355,21 @@ class DeepSeekAdapter:
         if _httpx_lib is None:
             raise RuntimeError("httpx is required for login() — install httpx>=0.27.0")
 
+        # Resolve proxy: explicit arg > DEEPSEEK_PROXY env > none
+        resolved_proxy = proxy
+        if resolved_proxy is None:
+            dp = os.environ.get("DEEPSEEK_PROXY", "").strip()
+            if dp:
+                resolved_proxy = dp
+
         try:
-            resp = _httpx_lib.post(
-                f"{BASE_URL}/api/v0/users/login",
-                json=payload,
-                headers=login_headers,
+            client = _httpx_lib.Client(
+                proxies={"all://": resolved_proxy} if resolved_proxy else None,
+                trust_env=False,  # ignore system http_proxy (nonsense in containers)
                 timeout=timeout,
-            )
+            ) if resolved_proxy else _httpx_lib.Client(trust_env=False, timeout=timeout)
+            resp = client.post(f"{BASE_URL}/api/v0/users/login", json=payload,
+                               headers=login_headers)
         except Exception as e:
             raise RuntimeError(f"Login request failed: {e}") from e
 
