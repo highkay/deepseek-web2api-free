@@ -97,11 +97,11 @@ def _is_ciphertext(value: str) -> bool:
 
 
 def encrypt_account_dict(acct: dict[str, Any]) -> dict[str, Any]:
-    """Return a new dict with token/cookies encrypted (in place of originals)."""
+    """Return a new dict with token/cookies/password encrypted (in place of originals)."""
     if not is_enabled():
         return acct
     out = dict(acct)
-    for field in ("token", "cookies"):
+    for field in ("token", "cookies", "password"):
         v = out.get(field)
         if isinstance(v, str) and v and not _is_ciphertext(v):
             out[field] = encrypt_str(v)
@@ -109,11 +109,11 @@ def encrypt_account_dict(acct: dict[str, Any]) -> dict[str, Any]:
 
 
 def decrypt_account_dict(acct: dict[str, Any]) -> dict[str, Any]:
-    """Return a new dict with token/cookies decrypted."""
+    """Return a new dict with token/cookies/password decrypted."""
     if not is_enabled():
         return acct
     out = dict(acct)
-    for field in ("token", "cookies"):
+    for field in ("token", "cookies", "password"):
         v = out.get(field)
         if isinstance(v, str) and v and _is_ciphertext(v):
             out[field] = decrypt_str(v)

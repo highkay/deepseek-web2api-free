@@ -193,15 +193,19 @@ class LoginResponse(BaseModel):
 
 
 class AccountAddRequest(BaseModel):
-    token: str
-    cookies: str
+    token: str = ""
+    cookies: str = ""
     email: str | None = ""
+    password: str | None = ""
+    mobile: str | None = ""
 
 
 class AccountUpdateRequest(BaseModel):
     token: str | None = None
     cookies: str | None = None
     email: str | None = None
+    password: str | None = None
+    mobile: str | None = None
 
 
 class AccountReloginResponse(BaseModel):
@@ -393,7 +397,13 @@ async def add_account(req: AccountAddRequest, request: Request):
     _check_auth(request)
     pool = get_pool()
     try:
-        acct = pool.add(token=req.token, cookies=req.cookies, email=req.email or "")
+        acct = pool.add(
+            token=req.token or "",
+            cookies=req.cookies or "",
+            email=req.email or "",
+            password=req.password or "",
+            mobile=req.mobile or "",
+        )
     except Exception as e:
         _pool_error(e)
     return {"ok": True, "account": acct.to_dict()}
@@ -404,7 +414,14 @@ async def update_account(account_id: str, req: AccountUpdateRequest, request: Re
     _check_auth(request)
     pool = get_pool()
     try:
-        acct = pool.update(account_id, token=req.token, cookies=req.cookies, email=req.email)
+        acct = pool.update(
+            account_id,
+            token=req.token,
+            cookies=req.cookies,
+            email=req.email,
+            password=req.password,
+            mobile=req.mobile,
+        )
     except Exception as e:
         _pool_error(e)
     return {"ok": True, "account": acct.to_dict()}

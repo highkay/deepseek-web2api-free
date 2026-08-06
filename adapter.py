@@ -19,6 +19,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from wasmtime import Store, Module, Instance
 
+# httpx is used for the login endpoint only (no curl_cffi needed for auth).
+try:
+    import httpx as _httpx_lib
+except ImportError:  # pragma: no cover
+    _httpx_lib = None
+
 try:
     from curl_cffi import requests as cffi_requests
 except ImportError as e:
@@ -295,6 +301,85 @@ class DeepSeekAdapter:
             "X-Client-Timezone-Offset": "28800",
             "x-client-bundle-id": "com.deepseek.chat",
         }
+
+    @staticmethod
+    def login(email: str = "", mobile: str = "",
+              password: str = "", timeout: float = 30) -> tuple[str, str]:
+        """Login to DeepSeek with email/mobile + password, return (token, cookies).
+
+        Uses plain httpx (no curl_cffi) with Android-style headers matching
+        what ds2api sends. The returned token can be passed directly to
+        ``DeepSeekAdapter(token=...)``, and the ``cookies`` string is a
+        semicolon-separated ``name=value`` pairs from the login response's
+        ``Set-Cookie`` headers (suitable for seeding the curl_cffi cookie jar).
+
+        Raises ``RuntimeError`` on login failure (bad credentials, network error).
+        """
+        if not password:
+            raise ValueError("password is required")
+        if not email and not mobile:
+            raise ValueError("email or mobile is required")
+
+        login_headers = {
+            "User-Agent": "DeepSeek/1.8.0 Android/35",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-client-platform": "android",
+            "x-client-version": "1.8.0",
+            "x-client-locale": "zh_CN",
+            "accept-charset": "UTF-8",
+        }
+        payload: dict = {
+            "password": password.strip(),
+            "device_id": "deepseek_to_api",
+            "os": "android",
+        }
+        if email:
+            payload["email"] = email.strip()
+        elif mobile:
+            digits = "".join(c for c in mobile if c.isdigit())
+            if (mobile.startswith("+") or digits.startswith("86")) and \
+                    digits.startswith("86") and len(digits) == 13:
+                payload["mobile"] = digits[2:]
+            else:
+                payload["mobile"] = digits
+            payload["area_code"] = None
+
+        if _httpx_lib is None:
+            raise RuntimeError("httpx is required for login() — install httpx>=0.27.0")
+
+        try:
+            resp = _httpx_lib.post(
+                f"{BASE_URL}/api/v0/users/login",
+                json=payload,
+                headers=login_headers,
+                timeout=timeout,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Login request failed: {e}") from e
+
+        data = resp.json()
+        code = data.get("code", -1)
+        if code != 0:
+            msg = data.get("msg", "unknown error")
+            raise RuntimeError(f"Login failed: {msg}")
+
+        biz = data.get("data", {}).get("biz_data", {})
+        if biz.get("code", -1) != 0:
+            msg = biz.get("msg", "unknown error")
+            raise RuntimeError(f"Login failed: {msg}")
+
+        user = biz.get("user", {})
+        token = (user.get("token") or "").strip()
+        if not token:
+            raise RuntimeError("Login succeeded but no token in response")
+
+        cookies = "; ".join(
+            f"{name}={value}"
+            for name, value in resp.cookies.items()
+        ) if resp.cookies else ""
+
+        return token, cookies
 
     @staticmethod
     def _normalize_token(token: str) -> str:

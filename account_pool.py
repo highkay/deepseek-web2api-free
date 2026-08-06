@@ -85,6 +85,8 @@ class Account:
     token: str
     cookies: str
     email: str = ""
+    password: str = field(default="", repr=False)
+    mobile: str = ""
     id: str = field(default_factory=_account_id)
     source: str = "file"       # file | env
     proxy: str = ""             # per-account upstream proxy (optional)
@@ -108,12 +110,15 @@ class Account:
 
     @property
     def fingerprint(self) -> str:
+        if self.email and self.password:
+            return hashlib.sha256(f"pw:{self.email}\0{self.mobile}\0{self.password}".encode()).hexdigest()
         return _credential_fingerprint(self.token, self.cookies)
 
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "email": self.email,
+            "mobile": self.mobile,
             "source": self.source,
             "state": self.state,
             "error_count": self.error_count,
@@ -123,6 +128,7 @@ class Account:
             "updated_at": self.updated_at,
             "token_preview": _mask_secret(self.token),
             "cookies_preview": _cookie_names(self.cookies),
+            "has_password": bool(self.password),
             "credential_fingerprint": self.fingerprint[:12],
             "read_only": self.source == "env",
         }
@@ -131,8 +137,10 @@ class Account:
         return {
             "id": self.id,
             "email": self.email,
+            "mobile": self.mobile,
             "token": self.token,
             "cookies": self.cookies,
+            "password": self.password,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -190,16 +198,19 @@ class AccountPool:
             item = decrypt_account_dict(item) if version == STORE_VERSION_ENCRYPTED else item
             token = str(item.get("token") or "").strip()
             cookies = str(item.get("cookies") or "").strip()
-            if not token or not cookies:
-                log.warning("skipping_account_missing_credentials", extra={"id": item.get("id")})
+            has_pw = bool(item.get("password"))
+            if not token and not has_pw:
+                log.warning("skipping_account_no_credentials", extra={"id": item.get("id")})
                 continue
             created_at = int(item.get("created_at") or _now())
             updated_at = int(item.get("updated_at") or created_at)
             self._append_loaded(Account(
                 id=str(item.get("id") or _account_id()),
                 email=str(item.get("email") or ""),
+                mobile=str(item.get("mobile") or ""),
                 token=token,
                 cookies=cookies,
+                password=str(item.get("password", "") or ""),
                 source="file",
                 created_at=created_at,
                 updated_at=updated_at,
@@ -294,18 +305,43 @@ class AccountPool:
 
     # ── CRUD ───────────────────────────────────────────────────
 
-    def add(self, token: str, cookies: str, email: str = "", persist: bool = True) -> Account:
+    def add(self, token: str, cookies: str, email: str = "",
+             password: str = "", mobile: str = "",
+             persist: bool = True) -> Account:
         token = (token or "").strip()
         cookies = (cookies or "").strip()
         email = (email or "").strip()
-        if not token or not cookies:
-            raise ValueError("Token and cookies are required")
+        password = (password or "").strip()
+        mobile = (mobile or "").strip()
+
+        if not token and not password:
+            raise ValueError("Either token or password is required")
+        if not email and not mobile:
+            raise ValueError("email or mobile is required when adding a password account")
+
+        # If only password given, perform login to get token+cookies
+        if not token and password:
+            from adapter import DeepSeekAdapter
+            try:
+                token, cookies = DeepSeekAdapter.login(
+                    email=email, mobile=mobile, password=password,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Auto-login failed for {email or mobile}: {e}") from e
 
         with self._lock:
-            fp = _credential_fingerprint(token, cookies)
-            if any(a.fingerprint == fp for a in self._accounts):
-                raise ValueError("Account already exists")
-            if not email:
+            if password and (email or mobile):
+                pw_dup = any(
+                    a.password and a.email == email and a.mobile == mobile
+                    for a in self._accounts
+                )
+                if pw_dup:
+                    raise ValueError("Account already exists")
+            else:
+                fp = _credential_fingerprint(token, cookies)
+                if any(a.fingerprint == fp for a in self._accounts):
+                    raise ValueError("Account already exists")
+            if not email and not mobile:
                 email = f"acc-{len(self._accounts) + 1}"
             now = _now()
             acct = Account(
@@ -313,6 +349,8 @@ class AccountPool:
                 token=token,
                 cookies=cookies,
                 email=email,
+                mobile=mobile,
+                password=password,
                 source="file" if persist else "memory",
                 created_at=now,
                 updated_at=now,
@@ -327,7 +365,8 @@ class AccountPool:
             return next((a for a in self._accounts if a.id == account_id), None)
 
     def update(self, account_id: str, token: str | None = None,
-               cookies: str | None = None, email: str | None = None) -> Account:
+               cookies: str | None = None, email: str | None = None,
+               password: str | None = None, mobile: str | None = None) -> Account:
         with self._lock:
             acct = next((a for a in self._accounts if a.id == account_id), None)
             if acct is None:
@@ -337,17 +376,22 @@ class AccountPool:
             new_token = acct.token if token is None or token == "" else token.strip()
             new_cookies = acct.cookies if cookies is None or cookies == "" else cookies.strip()
             new_email = acct.email if email is None else email.strip()
-            if not new_token or not new_cookies:
-                raise ValueError("Token and cookies cannot be empty")
+            new_password = acct.password if password is None else password.strip()
+            new_mobile = acct.mobile if mobile is None else mobile.strip()
+            if not new_token and not new_password:
+                raise ValueError("Token or password is required")
 
             new_fp = _credential_fingerprint(new_token, new_cookies)
             if any(a.id != account_id and a.fingerprint == new_fp for a in self._accounts):
                 raise ValueError("Account already exists")
 
-            credentials_changed = new_token != acct.token or new_cookies != acct.cookies
+            credentials_changed = (new_token != acct.token or new_cookies != acct.cookies
+                                   or new_password != acct.password)
             acct.token = new_token
             acct.cookies = new_cookies
             acct.email = new_email or acct.email
+            acct.password = new_password
+            acct.mobile = new_mobile
             acct.updated_at = _now()
             if credentials_changed:
                 acct._adapter = None
@@ -471,8 +515,14 @@ class AccountPool:
     # ── Health check / relogin ─────────────────────────────────
 
     def check_health(self, acct: Account) -> bool:
-        """Test if account credentials are valid by creating a session."""
+        """Test if account credentials are valid by creating a session.
+
+        If the account has email/mobile + password stored, an invalid token
+        is transparently re-logged-in and the fresh credentials are stored.
+        """
         try:
+            if acct.password and (acct.email or acct.mobile):
+                return self._relogin_by_password(acct)
             adapter = DeepSeekAdapter(token=acct.token, cookies=acct.cookies)
             adapter.create_session()
             return True
@@ -480,6 +530,31 @@ class AccountPool:
             with self._lock:
                 acct.state = "error"
                 acct.error_count += 1
+                acct.last_error = str(e)
+            return False
+
+    def _relogin_by_password(self, acct: Account) -> bool:
+        """Attempt to re-login a password-backed account and refresh its
+        token + cookies in place. Returns True on success."""
+        try:
+            from adapter import DeepSeekAdapter
+            token, cookies = DeepSeekAdapter.login(
+                email=acct.email, mobile=acct.mobile,
+                password=acct.password,
+            )
+            with self._lock:
+                acct.token = token
+                acct.cookies = cookies
+                acct._adapter = None
+                acct.state = "idle"
+                acct.error_count = 0
+                acct.last_error = ""
+                acct.updated_at = _now()
+                if acct.source == "file":
+                    self._save_persisted_accounts_locked()
+            return True
+        except Exception as e:
+            with self._lock:
                 acct.last_error = str(e)
             return False
 
