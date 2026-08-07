@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from adapter import DeepSeekAdapter, UpstreamEmptyError, UpstreamHintError, RateLimitError
+from adapter import DeepSeekAdapter, UpstreamEmptyError, UpstreamHintError, UpstreamNetworkError, RateLimitError
 from admin import (
     router as admin_router,
     get_pool,
@@ -699,7 +699,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
-        if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+        if isinstance(e, (RateLimitError, UpstreamEmptyError, UpstreamNetworkError)):
             if cache_key:
                 SESSION_CACHE.invalidate(cache_key)
         else:
@@ -749,7 +749,7 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
         except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
-            if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+            if isinstance(e, (RateLimitError, UpstreamEmptyError, UpstreamNetworkError)):
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
             else:
@@ -808,6 +808,13 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         if cache_key:
             SESSION_CACHE.invalidate(cache_key)
         raise HTTPException(status_code=502, detail="上游返回空响应（可能触发限流），请稍后重试")
+    except UpstreamNetworkError as e:
+        # A transport fault (dead proxy / unreachable upstream / timeout),
+        # NOT a credential problem — do NOT mark_error, or the pool drains
+        # to 503 every time the proxy flaps. The adapter already retried
+        # with backoff and tripped the circuit breaker.
+        get_stats().record(MODEL_NAME, 0, success=False)
+        raise HTTPException(status_code=502, detail=f"上游网络错误：{e}")
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
         pool.mark_error(acq.acct, str(e))
@@ -978,7 +985,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                                prompt_tokens=prompt_tokens)
             # Rate limit / transient empty responses are not credential
             # failures — keep the account usable instead of draining the pool.
-            if isinstance(e, (RateLimitError, UpstreamEmptyError)):
+            if isinstance(e, (RateLimitError, UpstreamEmptyError, UpstreamNetworkError)):
                 if cache_key:
                     SESSION_CACHE.invalidate(cache_key)
             else:
