@@ -35,6 +35,18 @@ except ImportError as e:
 
 from logger import get_logger
 
+# Transport-level failures from curl_cffi. Kept NARROW on purpose: all are
+# leaf classes under ``RequestException``, but ``HTTPError`` (4xx/5xx) is NOT
+# included so an HTTP status is never mistaken for a network fault — the
+# transport tuple maps to UpstreamNetworkError, HTTP statuses propagate as-is.
+_CFFI_EXC_MODULE = __import__("curl_cffi.requests.exceptions", fromlist=["*"])
+_TRANSPORT_EXC = tuple(
+    getattr(_CFFI_EXC_MODULE, n)
+    for n in ("ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout",
+              "ProxyError", "SSLError", "DNSError", "RetryError")
+    if hasattr(_CFFI_EXC_MODULE, n)
+)
+
 load_dotenv()
 log = get_logger("adapter")
 
@@ -55,6 +67,22 @@ try:
     RATE_LIMIT_RETRY_DELAYS = [float(x) for x in _raw_delays.split(",") if x.strip()]
 except ValueError:
     RATE_LIMIT_RETRY_DELAYS = []
+
+# Backoff delays applied to *network-level* failures (connection refused /
+# timeout / proxy error / TLS error / 5xx). These are transient transport
+# faults, distinct from rate limiting or empty responses, and are retried
+# with a fresh session. Disable by setting to empty.
+try:
+    _net_delays = os.environ.get("DEEPSEEK_NETWORK_RETRY_DELAYS", "0.5,1.5,3")
+    NETWORK_RETRY_DELAYS = [float(x) for x in _net_delays.split(",") if x.strip()]
+except ValueError:
+    NETWORK_RETRY_DELAYS = []
+
+# Circuit-breaker for a single upstream *path* (a connection-level fault).
+# When an account's client keeps hitting network-level failures, it should
+# be cooled down rather than hammering a dead proxy / unreachable upstream.
+BREAKER_ERROR_THRESHOLD = int(os.environ.get("DEEPSEEK_BREAKER_THRESHOLD", "3"))
+BREAKER_COOLDOWN_SECS = float(os.environ.get("DEEPSEEK_BREAKER_COOLDOWN", "30"))
 
 _WASM_PATH = Path(__file__).resolve().parent / "sha3_wasm_bg.wasm"
 with open(_WASM_PATH, "rb") as f:
@@ -95,6 +123,14 @@ class UpstreamHintError(RuntimeError):
 class RateLimitError(UpstreamHintError):
     """Upstream rate limiting (finish_reason ``rate_limit_reached``:
     '消息发送过于频繁，请稍后重试'). Maps to HTTP 429 on the server side."""
+
+
+class UpstreamNetworkError(RuntimeError):
+    """A network-level transport failure (connection refused / timeout /
+    proxy / TLS / 5xx). Transient by nature — retried with a fresh session
+    and subject to a circuit breaker, but never treated as a credential
+    error (so it doesn't drain the account pool on the proxy flapping).
+    """
 
 
 # Upstream hif signature headers: the browser fetches these from dedicated
@@ -239,19 +275,46 @@ class DeepSeekAdapter:
     )
 
     def __init__(self, token: str = TOKEN, cookies: str = COOKIES,
-                 impersonate: str = IMPERSONATE, proxy: str | None = None):
+                 impersonate: str = IMPERSONATE, proxy: str | None = None,
+                 trust_env: bool = False):
         self.token = self._normalize_token(token)
         self.cookies = cookies
         self.impersonate = impersonate
+        # Proxy resolution: explicit `proxy` arg takes precedence over the
+        # DEEPSEEK_PROXY env var (matching login()). A per-account proxy set
+        # in account_pool always overrides the global one.
+        if proxy is None:
+            proxy = (os.environ.get("DEEPSEEK_PROXY", "") or "").strip() or None
         self.proxy = proxy
+        # curl_cffi's `trust_env=False` does NOT stop libcurl from reading the
+        # container's HTTP(S)_PROXY env vars (verified on curl_cffi 0.7/0.8:
+        # requests.Session stores trust_env but never forwards it to the C
+        # layer). Those vars point at the host's Clash (127.0.0.1:7890),
+        # unreachable inside the container, which made EVERY upstream call
+        # fail with "Failed to connect ... over proxy 127.0.0.1". When no
+        # explicit proxy is configured, strip them from the process env so
+        # libcurl dials directly. (An explicit proxy below is unaffected.)
+        if not self.proxy:
+            for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                       "http_proxy", "https_proxy", "all_proxy"):
+                os.environ.pop(_k, None)
         self._solver = None
         # curl_cffi.Session keeps a cookie jar that auto-merges Set-Cookie,
         # so cf_clearance / AWS WAF tokens stay fresh across calls.
+        # trust_env=False is CRITICAL: it stops curl_cffi from inheriting the
+        # container's HTTP(S)_PROXY environment variables (e.g.
+        # http://127.0.0.1:7890 injected by the host's Clash, unreachable
+        # inside the container), which caused every upstream call to fail
+        # with "Failed to connect ... over proxy 127.0.0.1".
+        self._trust_env = trust_env
         self._client = cffi_requests.Session(
             impersonate=impersonate,
             timeout=120,
             proxies={"all": proxy} if proxy else None,
+            trust_env=self._trust_env,
         )
+        self._breaker_failures = 0
+        self._breaker_open_until = 0.0
         # Best-effort hif signature headers (see _HifProvider); never
         # fails the main request.
         self._hif = _HifProvider(client=self._client)
@@ -440,8 +503,41 @@ class DeepSeekAdapter:
             self._solver = _WASMSolver()
         return self._solver
 
+    def _request(self, method: str, url: str, client=None, **kwargs):
+        """Send a curl_cffi request, converting transport faults to
+        UpstreamNetworkError so callers can retry/classify them separately
+        from HTTP statuses (HTTPError propagates unchanged)."""
+        c = client or self._client
+        try:
+            return getattr(c, method)(url, **kwargs)
+        except _TRANSPORT_EXC as e:
+            raise UpstreamNetworkError(f"transport failure ({e.__class__.__name__}): {e}") from e
+
+    def _breaker_allow(self) -> bool:
+        if self._breaker_failures >= BREAKER_ERROR_THRESHOLD:
+            return time.monotonic() >= self._breaker_open_until
+        return True
+
+    def _breaker_on_success(self) -> None:
+        self._breaker_failures = 0
+        self._breaker_open_until = 0.0
+
+    def _breaker_on_failure(self) -> None:
+        self._breaker_failures += 1
+        if self._breaker_failures >= BREAKER_ERROR_THRESHOLD:
+            self._breaker_open_until = time.monotonic() + BREAKER_COOLDOWN_SECS
+
+    def _rebuild_client(self) -> None:
+        self._client = cffi_requests.Session(
+            impersonate=self.impersonate,
+            timeout=120,
+            proxies={"all": self.proxy} if self.proxy else None,
+            trust_env=self._trust_env,
+        )
+
     def _get_challenge(self, target_path: str = "/api/v0/chat/completion"):
-        resp = self._client.post(
+        resp = self._request(
+            "post",
             f"{BASE_URL}/api/v0/chat/create_pow_challenge",
             json={"target_path": target_path},
             headers=self._base_headers,
@@ -489,7 +585,8 @@ class DeepSeekAdapter:
     def create_session(self) -> str:
         """Create a new chat session, returns session_id"""
         headers = self._pow_headers("/api/v0/chat/completion", include_hif=False)
-        resp = self._client.post(
+        resp = self._request(
+            "post",
             f"{BASE_URL}/api/v0/chat_session/create",
             json={"target_path": "/api/v0/chat/completion"},
             headers=headers,
@@ -611,9 +708,12 @@ class DeepSeekAdapter:
                 impersonate=self.impersonate,
                 timeout=120,
                 proxies={"all": self.proxy} if self.proxy else None,
+                trust_env=self._trust_env,
             )
-        resp = client.post(
+        resp = self._request(
+            "post",
             f"{BASE_URL}/api/v0/chat/completion",
+            client=client,
             json=body,
             headers=headers,
         )
@@ -639,25 +739,45 @@ class DeepSeekAdapter:
         only care about the visible text should unpack with
         ``content, _ = adapter.chat(...)``.
         """
-        for attempt in range(1, max(len(RATE_LIMIT_RETRY_DELAYS), 1) + 2):
+        if not self._breaker_allow():
+            raise UpstreamNetworkError("circuit breaker open (too many network failures)")
+        rl_retries = 0
+        empty_retried = False
+        net_retries = 0
+        while True:
             try:
-                return self._chat_once(session_id, prompt, model_type=model_type,
-                                       thinking_enabled=thinking_enabled,
-                                       search_enabled=search_enabled,
-                                       parent_message_id=parent_message_id)
+                result = self._chat_once(
+                    session_id, prompt, model_type=model_type,
+                    thinking_enabled=thinking_enabled,
+                    search_enabled=search_enabled,
+                    parent_message_id=parent_message_id,
+                )
+                self._breaker_on_success()
+                return result
             except RateLimitError:
-                idx = attempt - 1
-                if idx >= len(RATE_LIMIT_RETRY_DELAYS):
+                if rl_retries >= len(RATE_LIMIT_RETRY_DELAYS):
                     raise
-                delay = RATE_LIMIT_RETRY_DELAYS[idx]
-                log.warning("upstream_rate_limit_retry_nonstream",
-                            extra={"attempt": attempt, "delay": delay})
+                delay = RATE_LIMIT_RETRY_DELAYS[rl_retries]
+                rl_retries += 1
+                log.warning("upstream_rate_limit_retry_nonstream", extra={"delay": delay})
                 time.sleep(delay)
                 session_id = self.create_session()
             except UpstreamEmptyError:
-                if attempt > 1:
+                if empty_retried:
                     raise
+                empty_retried = True
                 log.warning("upstream_empty_retry_nonstream")
+                session_id = self.create_session()
+            except UpstreamNetworkError:
+                self._breaker_on_failure()
+                if net_retries >= len(NETWORK_RETRY_DELAYS):
+                    raise
+                delay = NETWORK_RETRY_DELAYS[net_retries]
+                net_retries += 1
+                log.warning("upstream_network_retry_nonstream",
+                            extra={"retry": net_retries, "delay": delay})
+                time.sleep(delay)
+                self._rebuild_client()
                 session_id = self.create_session()
         raise UpstreamEmptyError("upstream returned empty response")  # pragma: no cover
 
@@ -778,7 +898,12 @@ class DeepSeekAdapter:
         once with a fresh session; if it is still empty an
         ``UpstreamEmptyError`` is raised.
         """
-        for attempt in range(1, max(len(RATE_LIMIT_RETRY_DELAYS), 1) + 2):
+        if not self._breaker_allow():
+            raise UpstreamNetworkError("circuit breaker open (too many network failures)")
+        rl_retries = 0
+        empty_retried = False
+        net_retries = 0
+        while True:
             yielded = False
             try:
                 for token in self._chat_stream_once(
@@ -788,23 +913,41 @@ class DeepSeekAdapter:
                         parent_message_id=parent_message_id):
                     yielded = True
                     yield token
+                if yielded:
+                    self._breaker_on_success()
+                    return
+                # Stream ended with no token at all → transient empty, retry
+                # once with a fresh session (matches legacy behavior).
+                if empty_retried:
+                    raise UpstreamEmptyError("upstream returned empty stream")
+                empty_retried = True
+                log.warning("upstream_empty_retry_stream")
             except RateLimitError:
-                idx = attempt - 1
-                if idx >= len(RATE_LIMIT_RETRY_DELAYS):
+                if rl_retries >= len(RATE_LIMIT_RETRY_DELAYS):
                     raise
-                delay = RATE_LIMIT_RETRY_DELAYS[idx]
-                log.warning("upstream_rate_limit_retry_stream",
-                            extra={"attempt": attempt, "delay": delay})
+                delay = RATE_LIMIT_RETRY_DELAYS[rl_retries]
+                rl_retries += 1
+                log.warning("upstream_rate_limit_retry_stream", extra={"delay": delay})
                 time.sleep(delay)
             except UpstreamEmptyError:
-                if attempt > 1:
+                if empty_retried:
                     raise
-            else:
+                empty_retried = True
                 if yielded:
                     return
                 log.warning("upstream_empty_retry_stream")
-            if attempt > max(len(RATE_LIMIT_RETRY_DELAYS), 1):
-                break
+            except UpstreamNetworkError:
+                self._breaker_on_failure()
+                if net_retries >= len(NETWORK_RETRY_DELAYS):
+                    raise
+                delay = NETWORK_RETRY_DELAYS[net_retries]
+                net_retries += 1
+                log.warning("upstream_network_retry_stream",
+                            extra={"retry": net_retries, "delay": delay})
+                time.sleep(delay)
+                self._rebuild_client()
+            if yielded:
+                return
             session_id = self.create_session()
         raise UpstreamEmptyError("upstream returned empty response")  # pragma: no cover
 
@@ -828,7 +971,8 @@ class DeepSeekAdapter:
             "search_enabled": search_enabled,
             "preempt": False,
         }
-        resp = self._client.post(
+        resp = self._request(
+            "post",
             f"{BASE_URL}/api/v0/chat/completion",
             json=body, headers=headers, stream=True,
         )
